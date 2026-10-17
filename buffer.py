@@ -22,7 +22,7 @@ class Buffer:
 
     def add_transition(self, data):
         # This is batched data and lifted for storage.
-        # (B, ...) -> (B, 1, ...)
+        # (N, ...) -> (N, 1, ...), N=config.env_num
         self._buffer.extend(data.unsqueeze(1))
 
     def sample(self):
