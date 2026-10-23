@@ -23,7 +23,7 @@ class Deter(nn.Module):
             nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
         )
         self._dyn_hid = nn.Sequential()
-        in_ch = (3 * hidden + deter // self.blocks) * self.blocks
+        in_ch = (3 * hidden + deter // self.blocks) * self.blocks #(3*512+2048/8)*8 = 1792*8
         for i in range(self.dynlayers):
             self._dyn_hid.add_module(f"dyn_hid_{i}", BlockLinear(in_ch, deter, self.blocks))
             self._dyn_hid.add_module(f"norm_{i}", nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32))
@@ -63,13 +63,13 @@ class Deter(nn.Module):
         x = self._dyn_gru(x)
 
         # Split GRU-style gates block-wise.
-        # (B, G, 3*D/G)
+        # (B, G, D/G) ,(B, G, D/G), (B, G, D/G)
         gates = torch.chunk(self.flat2group(x), 3, dim=-1)
 
-        # (B, D)
+        # (B, D), (B, D), (B, D)
         reset, cand, update = (self.group2flat(x) for x in gates)
         reset = torch.sigmoid(reset)
-        cand = torch.tanh(reset * cand)
+        cand = torch.tanh(reset * cand)  #由于输入端也有h，所以reset要在外面，才能把reset所有h
         update = torch.sigmoid(update - 1)
         # (B, D)
         return update * cand + (1 - update) * deter

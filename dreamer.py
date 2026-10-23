@@ -21,12 +21,12 @@ class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
         self.device = torch.device(config.device)
-        self.act_entropy = float(config.act_entropy)
-        self.kl_free = float(config.kl_free)
+        self.act_entropy = float(config.act_entropy)  #SAC中熵正则项的系数，0.0003
+        self.kl_free = float(config.kl_free)          #KL散度不更新的最小值，1
         self.imag_horizon = int(config.imag_horizon)
-        self.horizon = int(config.horizon)
+        self.horizon = int(config.horizon)            #视野，也是/gamma
         self.lamb = float(config.lamb)
-        self.return_ema = networks.ReturnEMA(device=self.device)
+        self.return_ema = networks.ReturnEMA(device=self.device)  #计算return（batch内）5%和95%分位数的EMA，其差值就是S,Advantage的scale
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
 
@@ -55,16 +55,16 @@ class Dreamer(nn.Module):
 
         # Actor-critic components
         self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
+        self.value = networks.MLPHead(config.critic, self.rssm.feat_size) #TODO_ensemble
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
-        self._slow_value = copy.deepcopy(self.value)
+        self._slow_value = copy.deepcopy(self.value) #约束Value的训练，不要变化太大
         for param in self._slow_value.parameters():
             param.requires_grad = False
         self._slow_value_updates = 0
 
-        self._loss_scales = dict(config.loss_scales)
-        self._log_grads = bool(config.log_grads)
+        self._loss_scales = dict(config.loss_scales) #各个loss前面的系数
+        self._log_grads = bool(config.log_grads) #梯度和参数更新统计的日志开关，默认False,用于观察训练是否稳定
 
         modules = {
             "rssm": self.rssm,
@@ -82,7 +82,7 @@ class Dreamer(nn.Module):
                 self.rssm.flat_stoch,
                 shapes,
             )
-            recon = self._loss_scales.pop("recon")
+            recon = self._loss_scales.pop("recon") #1.0
             self._loss_scales.update({k: recon for k in self.decoder.all_keys})
             modules.update({"decoder": self.decoder})
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
@@ -123,7 +123,7 @@ class Dreamer(nn.Module):
                 "ema_obs_proj": self._ema_obs_proj,
             })
         # count number of parameters in each module
-        for key, module in modules.items():
+        for key, module in modules.items(): #打印各个网络的大小
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
@@ -140,24 +140,24 @@ class Dreamer(nn.Module):
         def _agc(params):
             clip_grad_agc_(params, float(config.agc), float(config.pmin), foreach=True)
 
-        self._agc = _agc
+        self._agc = _agc  #自适应梯度裁剪Adaptive Gradient Clipping，在optimizer更新前，缩小过大的梯度
         self._optimizer = LaProp(
             self._named_params.values(),
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             eps=config.eps,
         )
-        self._scaler = GradScaler()
+        self._scaler = GradScaler() #保护小梯度
 
         def lr_lambda(step):
             if config.warmup:
                 return min(1.0, (step + 1) / config.warmup)
             return 1.0
 
-        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
+        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda) #先逐渐增大学习率，再保持不变
 
         self.train()
-        self.clone_and_freeze()
+        self.clone_and_freeze()    #把所有网络都克隆一份，以供actor-critic learning使用
         if config.compile:
             print("Compiling update function with torch.compile...")
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
@@ -220,7 +220,7 @@ class Dreamer(nn.Module):
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
-        self._frozen_value = copy.deepcopy(self.value)
+        self._frozen_value = copy.deepcopy(self.value) #TODO_JYY因为改了self.value，这里肯定也要看看
         for (name_orig, param_orig), (name_new, param_new) in zip(
             self.value.named_parameters(), self._frozen_value.named_parameters()
         ):
@@ -247,7 +247,7 @@ class Dreamer(nn.Module):
         """Policy inference step."""
         # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
-        p_obs = self.preprocess(obs)
+        p_obs = self.preprocess(obs) # 图像预处理
         # (B, E)
         embed = self._frozen_encoder(p_obs)
         prev_stoch, prev_deter, prev_action = (
@@ -261,7 +261,7 @@ class Dreamer(nn.Module):
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)
         # (B, A)
-        action = action_dist.mode if eval else action_dist.rsample()
+        action = action_dist.mode if eval else action_dist.rsample() #在高斯分布中采样, .mode返回均值/mu，所以在推理时的action没有不确定性
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,
@@ -449,7 +449,7 @@ class Dreamer(nn.Module):
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
         # (B*T, T_imag, 1)
-        imag_value = self._frozen_value(imag_feat).mode()
+        imag_value = self._frozen_value(imag_feat).mode() #TODO_JYY
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
@@ -469,11 +469,11 @@ class Dreamer(nn.Module):
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
 
-        imag_value_dist = self.value(imag_feat)
+        imag_value_dist = self.value(imag_feat) #TODO_JYY，self.value改成ensemble，这里肯定也要改
         # (B*T, T_imag, 1)
-        tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+        tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1) #补一个0，(M,15,1) -> (M,16,1)
         losses["value"] = torch.mean(
-            weight[:, :-1].detach()
+            weight[:, :-1].detach()  #TODO_JYY,作者说这是为了“to softly account for the possibility of episode ends.”可以琢磨琢磨改进方法
             * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
                 :, :-1
             ].unsqueeze(-1)
@@ -494,7 +494,7 @@ class Dreamer(nn.Module):
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
 
-        # === Replay-based value learning (keep gradients through world model) ===
+        # === Replay-based value learning (keep gradients through world model) === TODO_JYY，这处很棘手，要考虑rep_value如何分配权重
         last, term, reward = (
             to_f32(data["is_last"]),
             to_f32(data["is_terminal"]),
@@ -530,7 +530,7 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon):
+    def _imagine(self, start, imag_horizon): #TODO_JYY
         """Roll out the policy in latent space."""
         # (B, S, K), (B, D)
         feats = []
@@ -558,7 +558,7 @@ class Dreamer(nn.Module):
         """
         assert last.shape == term.shape == reward.shape == value.shape == boot.shape
         live = (1 - to_f32(term))[:, 1:] * disc
-        cont = (1 - to_f32(last))[:, 1:] * lamb
+        cont = (1 - to_f32(last))[:, 1:] * lamb #TODO_JYY
         interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
         out = [boot[:, -1]]
         for i in reversed(range(live.shape[1])):

@@ -374,7 +374,7 @@ class MLPHead(nn.Module):
     def forward(self, x):
         """Produce a distribution head."""
         # (B, T, F)
-        return self._dist(self.last(self.mlp(x)))
+        return self._dist(self.last(self.mlp(x)))  #返回分布
 
 
 class Projector(nn.Module):
