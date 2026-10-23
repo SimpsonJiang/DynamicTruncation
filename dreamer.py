@@ -29,6 +29,13 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)  #计算return（batch内）5%和95%分位数的EMA，其差值就是S,Advantage的scale
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
+        self.value_ensemble_size = config.value_ensemble_size
+        if (
+            isinstance(self.value_ensemble_size, bool)
+            or not isinstance(self.value_ensemble_size, int)
+            or self.value_ensemble_size < 2
+        ):
+            raise ValueError("model.value_ensemble_size must be an integer of at least 2")
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -55,7 +62,9 @@ class Dreamer(nn.Module):
 
         # Actor-critic components
         self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value = networks.MLPHead(config.critic, self.rssm.feat_size) #TODO_ensemble
+        self.value = nn.ModuleList(
+            [networks.MLPHead(config.critic, self.rssm.feat_size) for _ in range(self.value_ensemble_size)]
+        )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value) #约束Value的训练，不要变化太大
@@ -163,7 +172,7 @@ class Dreamer(nn.Module):
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
 
     def _update_slow_target(self):
-        """Update slow-moving value target network."""
+        """Update each slow value head from its matching online head."""
         if self._slow_value_updates % self.slow_target_update == 0:
             with torch.no_grad():
                 mix = self.slow_target_fraction
@@ -220,7 +229,7 @@ class Dreamer(nn.Module):
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
-        self._frozen_value = copy.deepcopy(self.value) #TODO_JYY因为改了self.value，这里肯定也要看看
+        self._frozen_value = copy.deepcopy(self.value)
         for (name_orig, param_orig), (name_new, param_new) in zip(
             self.value.named_parameters(), self._frozen_value.named_parameters()
         ):
@@ -448,9 +457,13 @@ class Dreamer(nn.Module):
         imag_reward = self._frozen_reward(imag_feat).mode()
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
-        # (B*T, T_imag, 1)
-        imag_value = self._frozen_value(imag_feat).mode() #TODO_JYY
-        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+        # (value_ensemble_size, B*T, T_imag, 1)
+        imag_values = torch.stack([head(imag_feat).mode() for head in self._frozen_value])
+        imag_slow_values = torch.stack([head(imag_feat).mode() for head in self._frozen_slow_value])
+        # One pair per update, shared by the whole batch, time axis, bootstrap, and advantage.
+        value_pair = torch.randperm(self.value_ensemble_size, device=imag_feat.device)[:2]
+        # (B*T, T_imag, 1): average scalar predictions, not distribution logits.
+        imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
@@ -469,15 +482,9 @@ class Dreamer(nn.Module):
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
 
-        imag_value_dist = self.value(imag_feat) #TODO_JYY，self.value改成ensemble，这里肯定也要改
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1) #补一个0，(M,15,1) -> (M,16,1)
-        losses["value"] = torch.mean(
-            weight[:, :-1].detach()  #TODO_JYY,作者说这是为了“to softly account for the possibility of episode ends.”可以琢磨琢磨改进方法
-            * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
-                :, :-1
-            ].unsqueeze(-1)
-        )
+        losses["value"] = self._value_loss(imag_feat, tar_padded, imag_slow_values, weight)
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -489,7 +496,8 @@ class Dreamer(nn.Module):
         metrics["rew"] = torch.mean(imag_reward)
         metrics["val"] = torch.mean(imag_value)
         metrics["tar"] = torch.mean(ret)
-        metrics["slowval"] = torch.mean(imag_slow_value)
+        metrics["slowval"] = torch.mean(imag_slow_values)
+        metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
@@ -502,25 +510,23 @@ class Dreamer(nn.Module):
         )
         feat = self.rssm.get_feat(post_stoch, post_deter)
         boot = ret[:, 0].reshape(B, T, 1)
-        value = self._frozen_value(feat).mode()
-        slow_value = self._frozen_slow_value(feat).mode()
+        # Target predictions need no gradients; replay features below remain attached for repval.
+        with torch.no_grad():
+            values = torch.stack([head(feat).mode() for head in self._frozen_value])
+            slow_values = torch.stack([head(feat).mode() for head in self._frozen_slow_value])
+        value = values.mean(dim=0)
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last
         ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
         # Keep this attached to the world model so gradients can flow through
-        value_dist = self.value(feat)
-        losses["repval"] = torch.mean(
-            weight[:, :-1]
-            * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(
-                -1
-            )
-        )
+        losses["repval"] = self._value_loss(feat, ret_padded, slow_values, weight)
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
         metrics.update(tools.tensorstats(value, "value_replay"))
-        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+        metrics.update(tools.tensorstats(slow_values.mean(dim=0), "slow_value_replay"))
+        metrics["value_ensemble_std_replay"] = values.std(dim=0, unbiased=False).mean()
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
         self._scaler.scale(total_loss).backward()
@@ -528,6 +534,21 @@ class Dreamer(nn.Module):
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), metrics
+
+    def _value_loss(self, feat, target, slow_values, weight):
+        """Average member losses using one return target and a matching slow target per member.
+
+        feat: (B, T, F), target/weight: (B, T, 1), slow_values: (value_ensemble_size, B, T, 1).
+        Gradients flow through feat only when the caller leaves it attached.
+        """
+        target = target.detach()
+        weight = weight[:, :-1].detach()
+        losses = []
+        for i, head in enumerate(self.value):
+            dist = head(feat)
+            nll = -dist.log_prob(target) - dist.log_prob(slow_values[i].detach())
+            losses.append(torch.mean(weight * nll[:, :-1].unsqueeze(-1)))
+        return torch.stack(losses).mean()
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon): #TODO_JYY

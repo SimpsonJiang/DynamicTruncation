@@ -33,6 +33,16 @@ Switching algorithms:
 python3 train.py model.rep_loss=r2dreamer
 ```
 
+The value ensemble defaults to 5 independent heads and requires at least 2. For example:
+
+```bash
+python3 train.py model.rep_loss=dreamer model.value_ensemble_size=5
+```
+
+Each update samples two heads whose mean predicts imagination bootstrap values and the
+advantage baseline. All heads train on the same return targets, with a separate slow
+target per head; their losses are averaged before backpropagation.
+
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
 
