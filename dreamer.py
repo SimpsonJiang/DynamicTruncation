@@ -484,7 +484,8 @@ class Dreamer(nn.Module):
 
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1) #补一个0，(M,15,1) -> (M,16,1)
-        losses["value"] = self._value_loss(imag_feat, tar_padded, imag_slow_values, weight)
+        imag_value_dist = [head(imag_feat) for head in self.value]
+        losses["value"] = self._value_loss(imag_value_dist, tar_padded, imag_slow_values, weight)
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -498,6 +499,7 @@ class Dreamer(nn.Module):
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_values)
         metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
+        metrics["imag_wasser"] = self._imag_wasserstein(imag_value_dist)
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
@@ -521,7 +523,8 @@ class Dreamer(nn.Module):
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
         # Keep this attached to the world model so gradients can flow through
-        losses["repval"] = self._value_loss(feat, ret_padded, slow_values, weight)
+        value_dist = [head(feat) for head in self.value]
+        losses["repval"] = self._value_loss(value_dist, ret_padded, slow_values, weight)
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
         metrics.update(tools.tensorstats(value, "value_replay"))
@@ -535,20 +538,33 @@ class Dreamer(nn.Module):
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), metrics
 
-    def _value_loss(self, feat, target, slow_values, weight):
+    def _value_loss(self, value_dists, target, slow_values, weight):
         """Average member losses using one return target and a matching slow target per member.
 
-        feat: (B, T, F), target/weight: (B, T, 1), slow_values: (value_ensemble_size, B, T, 1).
-        Gradients flow through feat only when the caller leaves it attached.
+        value_dists: list of distributions with batch (B, T), target/weight: (B, T, 1),
+        slow_values: (value_ensemble_size, B, T, 1).
+        Gradients flow through the features used to construct the distributions when attached.
         """
         target = target.detach()
         weight = weight[:, :-1].detach()
         losses = []
-        for i, head in enumerate(self.value):
-            dist = head(feat)
+        for i, dist in enumerate(value_dists):
             nll = -dist.log_prob(target) - dist.log_prob(slow_values[i].detach())
             losses.append(torch.mean(weight * nll[:, :-1].unsqueeze(-1)))
         return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def _imag_wasserstein(self, value_dists):
+        """Mean pairwise W1 on shared return bins, excluding the final bootstrap state."""
+        # Each CDF has shape (B*T, T_imag-1, num_bins-1); all heads share the same bins.
+        cdfs = [to_f32(dist.probs.detach()[:, :-1]).cumsum(dim=-1)[..., :-1] for dist in value_dists]
+        widths = to_f32(value_dists[0].bins.detach()).diff()
+        total = widths.new_zeros(())
+        for i in range(len(cdfs)):
+            for j in range(i + 1, len(cdfs)):
+                # Reduce each pair immediately instead of materializing all pairwise distances.
+                total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1).mean()
+        return total / (len(cdfs) * (len(cdfs) - 1) // 2)
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon): #TODO_JYY

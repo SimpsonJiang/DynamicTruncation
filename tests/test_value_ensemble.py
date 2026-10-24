@@ -12,6 +12,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
+from distributions import TwoHot
 from dreamer import Dreamer
 from networks import MLPHead
 
@@ -126,7 +127,8 @@ class ValueEnsembleTest(unittest.TestCase):
         expected = torch.stack(expected).mean()
         parameters = list(agent.value.parameters()) + [feat]
         expected_grads = torch.autograd.grad(expected, parameters)
-        loss = agent._value_loss(feat, target, slow, weight)
+        value_dists = [head(feat) for head in agent.value]
+        loss = agent._value_loss(value_dists, target, slow, weight)
         torch.testing.assert_close(loss, expected)
         loss.backward()
         for param, expected_grad in zip(parameters, expected_grads):
@@ -135,6 +137,96 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertIsNone(slow.grad)
         self.assertEqual(feat.grad[:, -1].abs().sum().item(), 0)
         self.assertEqual(feat.grad[0, 1].abs().sum().item(), 0)
+
+    def test_wasserstein_identical_and_point_mass_distributions(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-3.0, -1.0, 4.0])
+        left = TwoHot(torch.tensor([1.0, 0.0, 0.0]).log().expand(2, 4, -1), bins)
+        right = TwoHot(torch.tensor([0.0, 0.0, 1.0]).log().expand(2, 4, -1), bins)
+        torch.testing.assert_close(agent._imag_wasserstein([left] * 5), torch.tensor(0.0))
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(7.0))
+
+    def test_wasserstein_uses_full_distribution_and_nonuniform_spacing(self):
+        agent = self.make_agent()
+        # Moving half the mass from -3 to 4 costs 0.5 * 7, regardless of the middle bin.
+        bins = torch.tensor([-3.0, -1.0, 4.0])
+        left = TwoHot(torch.tensor([0.5, 0.5, 0.0]).log().expand(2, 4, -1), bins)
+        right = TwoHot(torch.tensor([0.0, 0.5, 0.5]).log().expand(2, 4, -1), bins)
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(3.5))
+        # Equal means do not imply equal distributions: each half travels a distance of 2.
+        bins = torch.tensor([-2.0, 0.0, 2.0])
+        spread = TwoHot(torch.tensor([0.5, 0.0, 0.5]).log().expand(2, 4, -1), bins)
+        center = TwoHot(torch.tensor([0.0, 1.0, 0.0]).log().expand(2, 4, -1), bins)
+        torch.testing.assert_close(spread.mode(), center.mode())
+        torch.testing.assert_close(agent._imag_wasserstein([spread, center]), torch.tensor(2.0))
+
+    def test_wasserstein_averages_all_unordered_pairs(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-3.0, -1.0, 0.0, 4.0, 10.0])
+        dists = [TwoHot(prob.log().expand(2, 4, -1), bins) for prob in torch.eye(5)]
+        # The ten distances are 2, 3, 7, 13, 1, 5, 11, 4, 10, 6; their sum is 62.
+        torch.testing.assert_close(agent._imag_wasserstein(dists), torch.tensor(6.2))
+        permuted = [dists[i] for i in [3, 0, 4, 1, 2]]
+        torch.testing.assert_close(agent._imag_wasserstein(permuted), torch.tensor(6.2))
+
+    def test_wasserstein_averages_states_and_excludes_bootstrap(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-1.0, 3.0])
+        left = TwoHot(torch.tensor([1.0, 0.0]).log().expand(2, 3, -1), bins)
+        probabilities = torch.tensor([[[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0]] * 3])
+        right = TwoHot(probabilities.log(), bins)
+        # Distances at the four included positions are 4, 0, 4, 4.
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(3.0))
+        probabilities[:, -1] = torch.tensor([1.0, 0.0])
+        right = TwoHot(probabilities.log(), bins)
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(3.0))
+
+    def test_wasserstein_is_detached_float32_under_autocast(self):
+        agent = self.make_agent()
+        # This spacing overflows float16 unless bins are promoted before taking their difference.
+        bins = torch.tensor([-60000.0, 60000.0], dtype=torch.float16)
+        left_logits = torch.tensor([0.0, -torch.inf], dtype=torch.float16, requires_grad=True)
+        right_logits = torch.tensor([-torch.inf, 0.0], dtype=torch.float16, requires_grad=True)
+        with torch.autocast(device_type="cpu", dtype=torch.float16):
+            dists = [TwoHot(logits.expand(2, 4, -1), bins) for logits in [left_logits, right_logits]]
+            metric = agent._imag_wasserstein(dists)
+        self.assertEqual(metric.dtype, torch.float32)
+        self.assertEqual(metric.ndim, 0)
+        self.assertFalse(metric.requires_grad)
+        torch.testing.assert_close(metric, torch.tensor(120000.0))
+        self.assertIsNone(left_logits.grad)
+        self.assertIsNone(right_logits.grad)
+
+    def test_wasserstein_logging_preserves_losses_and_gradients(self):
+        agent = self.make_agent(outscale=0.1)
+        data, initial = self.make_batch(agent)
+        state = {name: value.clone() for name, value in agent.state_dict().items()}
+        torch.manual_seed(29)
+        with mock.patch.object(agent, "_imag_wasserstein", return_value=torch.tensor(0.0)):
+            _, reference = agent._cal_grad(data, initial)
+        losses = {key: value.detach().clone() for key, value in reference.items() if "loss" in key}
+        grads = {name: None if p.grad is None else p.grad.clone() for name, p in agent._named_params.items()}
+        agent.load_state_dict(state)
+        agent.zero_grad(set_to_none=True)
+        torch.manual_seed(29)
+        with mock.patch.object(agent, "_value_loss", wraps=agent._value_loss) as value_loss:
+            _, metrics = agent._cal_grad(data, initial)
+        self.assertEqual(value_loss.call_count, 2)
+        imag_dists = value_loss.call_args_list[0].args[0]
+        self.assertEqual(len(imag_dists), 5)
+        torch.testing.assert_close(metrics["imag_wasser"], agent._imag_wasserstein(imag_dists))
+        self.assertEqual(metrics["imag_wasser"].ndim, 0)
+        self.assertFalse(metrics["imag_wasser"].requires_grad)
+        self.assertTrue(torch.isfinite(metrics["imag_wasser"]))
+        self.assertGreater(metrics["imag_wasser"].item(), 0)
+        self.assertNotIn("img_wasser", metrics)
+        for key, value in losses.items():
+            torch.testing.assert_close(metrics[key], value, rtol=0, atol=0)
+        for name, param in agent._named_params.items():
+            if grads[name] is None:
+                self.assertIsNone(param.grad)
+            else:
+                torch.testing.assert_close(param.grad, grads[name], rtol=0, atol=0)
 
     def test_loss_gradient_boundaries(self):
         for active in ["policy", "value", "repval"]:
