@@ -19,6 +19,13 @@ value_ensemble_size: 5
 slow_target_update: 1
 slow_target_fraction: 0.02
 
+dynamic_trunc:
+  enabled: true
+  quantile: 0.95
+  threshold_scale: 1.0
+  threshold_ema: 0.999
+  min_horizon: 8
+
 loss_scales:
   barlow: 0.05
   infonce: 1.0

@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
+from dynamic_truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
@@ -36,6 +37,25 @@ class Dreamer(nn.Module):
             or self.value_ensemble_size < 2
         ):
             raise ValueError("model.value_ensemble_size must be an integer of at least 2")
+
+        trunc = config.get("dynamic_trunc", {})
+        self.dynamic_trunc_enabled = bool(trunc.get("enabled", True))
+        self.dynamic_trunc_quantile = float(trunc.get("quantile", 0.95))
+        self.dynamic_trunc_threshold_scale = float(trunc.get("threshold_scale", 1.0))
+        self.dynamic_trunc_min_horizon = trunc.get("min_horizon", 8)
+        if not 0.0 <= self.dynamic_trunc_quantile <= 1.0:
+            raise ValueError("dynamic_trunc.quantile must be in [0, 1]")
+        if not math.isfinite(self.dynamic_trunc_threshold_scale) or self.dynamic_trunc_threshold_scale <= 0:
+            raise ValueError("dynamic_trunc.threshold_scale must be finite and positive")
+        if (
+            isinstance(self.dynamic_trunc_min_horizon, bool)
+            or not isinstance(self.dynamic_trunc_min_horizon, int)
+            or self.dynamic_trunc_min_horizon < 0
+        ):
+            raise ValueError("dynamic_trunc.min_horizon must be a non-negative integer")
+        if self.imag_horizon < 1:
+            raise ValueError("imag_horizon must be at least 1")
+        self.trunc_kappa = ThresholdEMA(float(trunc.get("threshold_ema", 0.999))) if self.dynamic_trunc_enabled else None
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -464,15 +484,32 @@ class Dreamer(nn.Module):
         value_pair = torch.randperm(self.value_ensemble_size, device=imag_feat.device)[:2]
         # (B*T, T_imag, 1): average scalar predictions, not distribution logits.
         imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
+        imag_value_dist = [head(imag_feat) for head in self.value]
+        # (B*T, H, 1): each trajectory gates on its own current-state disagreement.
+        imag_uncertainty = self._imag_wasserstein(imag_value_dist)
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
-        last = torch.zeros_like(imag_cont)
+        loss_mask = 1.0
+        if self.dynamic_trunc_enabled:
+            raw_threshold = torch.quantile(imag_uncertainty[:, 0].reshape(-1), self.dynamic_trunc_quantile)
+            raw_threshold = raw_threshold * self.dynamic_trunc_threshold_scale
+            threshold = self.trunc_kappa(raw_threshold)
+            trunc_mask = build_truncation_mask(imag_uncertainty, threshold, self.dynamic_trunc_min_horizon)
+            loss_mask = normalized_mask(trunc_mask)
+            last = mask_to_last(trunc_mask)
+            metrics["dynamic_trunc/threshold_raw"] = raw_threshold
+            metrics["dynamic_trunc/threshold"] = threshold
+            metrics["dynamic_trunc/keep_rate"] = trunc_mask.float().mean()
+            metrics["dynamic_trunc/effective_horizon"] = trunc_mask.float().sum(dim=1).mean()
+        else:
+            last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
         ret = self._lambda_return(
             last, term, imag_reward, imag_value, imag_value, disc, self.lamb
         )  # (B*T, T_imag-1, 1)
-        ret_offset, ret_scale = self.return_ema(ret)
+        ret_for_stats = torch.where(trunc_mask, ret, imag_value[:, :-1]) if self.dynamic_trunc_enabled else ret
+        ret_offset, ret_scale = self.return_ema(ret_for_stats)
         # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
@@ -480,12 +517,13 @@ class Dreamer(nn.Module):
         # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+        losses["policy"] = torch.mean(
+            weight[:, :-1].detach() * loss_mask * -(logpi * adv.detach() + self.act_entropy * entropy)
+        )
 
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1) #补一个0，(M,15,1) -> (M,16,1)
-        imag_value_dist = [head(imag_feat) for head in self.value]
-        losses["value"] = self._value_loss(imag_value_dist, tar_padded, imag_slow_values, weight)
+        losses["value"] = self._value_loss(imag_value_dist, tar_padded, imag_slow_values, weight, loss_mask)
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -499,7 +537,7 @@ class Dreamer(nn.Module):
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_values)
         metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
-        metrics["imag_wasser"] = self._imag_wasserstein(imag_value_dist)
+        metrics["imag_wasser"] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
@@ -538,7 +576,7 @@ class Dreamer(nn.Module):
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), metrics
 
-    def _value_loss(self, value_dists, target, slow_values, weight):
+    def _value_loss(self, value_dists, target, slow_values, weight, loss_mask=1.0):
         """Average member losses using one return target and a matching slow target per member.
 
         value_dists: list of distributions with batch (B, T), target/weight: (B, T, 1),
@@ -547,6 +585,7 @@ class Dreamer(nn.Module):
         """
         target = target.detach()
         weight = weight[:, :-1].detach()
+        weight = weight * loss_mask
         losses = []
         for i, dist in enumerate(value_dists):
             nll = -dist.log_prob(target) - dist.log_prob(slow_values[i].detach())
@@ -555,15 +594,15 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def _imag_wasserstein(self, value_dists):
-        """Mean pairwise W1 on shared return bins, excluding the final bootstrap state."""
+        """Per-state mean pairwise W1, shape (B*T, H, 1), excluding the final bootstrap state."""
         # Each CDF has shape (B*T, T_imag-1, num_bins-1); all heads share the same bins.
         cdfs = [to_f32(dist.probs.detach()[:, :-1]).cumsum(dim=-1)[..., :-1] for dist in value_dists]
         widths = to_f32(value_dists[0].bins.detach()).diff()
-        total = widths.new_zeros(())
+        total = torch.zeros_like(cdfs[0][..., :1])
         for i in range(len(cdfs)):
             for j in range(i + 1, len(cdfs)):
                 # Reduce each pair immediately instead of materializing all pairwise distances.
-                total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1).mean()
+                total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1, keepdim=True)
         return total / (len(cdfs) * (len(cdfs) - 1) // 2)
 
     @torch.no_grad()

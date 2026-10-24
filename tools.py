@@ -161,12 +161,17 @@ class Logger:
         self._last_step = None
         self._last_time = None
         self._scalars = {}
+        self._vectors = {}
         self._images = {}
         self._videos = {}
         self._histograms = {}
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
+
+    def vector(self, name, value):
+        """Preserve a per-step vector's shape in JSON and log each entry to TensorBoard."""
+        self._vectors[name] = np.array(value, copy=True)
 
     def image(self, name, value):
         self._images[name] = np.array(value)
@@ -183,12 +188,16 @@ class Logger:
             scalars.append(("fps/fps", self._compute_fps(step)))
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / self._filename).open("a") as f:
-            f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+            vectors = {name: value.tolist() for name, value in self._vectors.items()}
+            f.write(json.dumps({"step": step, **dict(scalars), **vectors}) + "\n")
         for name, value in scalars:
             if "/" not in name:
                 self._writer.add_scalar("scalars/" + name, value, step)
             else:
                 self._writer.add_scalar(name, value, step)
+        for name, value in self._vectors.items():
+            for index, entry in enumerate(value.reshape(-1)):
+                self._writer.add_scalar(f"{name}/step_{index:02d}", float(entry), step)
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
         for name, value in self._videos.items():
@@ -203,6 +212,7 @@ class Logger:
 
         self._writer.flush()
         self._scalars = {}
+        self._vectors = {}
         self._images = {}
         self._videos = {}
 

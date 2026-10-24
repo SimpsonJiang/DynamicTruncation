@@ -180,7 +180,10 @@ class OnlineTrainer:
                 if self._should_log(step):
                     for name, value in train_metrics.items():
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-                        self.logger.scalar(f"train/{name}", value)
+                        if name == "imag_wasser":
+                            self.logger.vector(f"train/{name}", value)
+                        else:
+                            self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
                     if self.video_pred_log:
                         data, _, initial = self.replay_buffer.sample()

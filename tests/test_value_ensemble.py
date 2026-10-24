@@ -45,10 +45,12 @@ class ValueEnsembleTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
 
-    def make_agent(self, size=5, outscale=0.0):
+    def make_agent(self, size=5, outscale=0.0, trunc_enabled=False, min_horizon=8):
         config = OmegaConf.create(self.config)
         config.value_ensemble_size = size
         config.critic.outscale = outscale
+        config.dynamic_trunc.enabled = trunc_enabled
+        config.dynamic_trunc.min_horizon = min_horizon
         with contextlib.redirect_stdout(io.StringIO()):
             agent = Dreamer(config, self.obs_space, self.act_space).to("cpu")
         return agent
@@ -87,6 +89,7 @@ class ValueEnsembleTest(unittest.TestCase):
     def test_independent_members_preserve_architecture_and_initialization(self):
         agent = self.make_agent()
         self.assertEqual(self.config["value_ensemble_size"], 5)
+        self.assertTrue(self.config["dynamic_trunc"]["enabled"])
         self.assertEqual(len(agent.value), 5)
         reference = MLPHead(OmegaConf.create(self.config["critic"]), agent.rssm.feat_size)
         shapes = {name: param.shape for name, param in reference.named_parameters()}
@@ -143,8 +146,8 @@ class ValueEnsembleTest(unittest.TestCase):
         bins = torch.tensor([-3.0, -1.0, 4.0])
         left = TwoHot(torch.tensor([1.0, 0.0, 0.0]).log().expand(2, 4, -1), bins)
         right = TwoHot(torch.tensor([0.0, 0.0, 1.0]).log().expand(2, 4, -1), bins)
-        torch.testing.assert_close(agent._imag_wasserstein([left] * 5), torch.tensor(0.0))
-        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(7.0))
+        torch.testing.assert_close(agent._imag_wasserstein([left] * 5), torch.zeros(2, 3, 1))
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.full((2, 3, 1), 7.0))
 
     def test_wasserstein_uses_full_distribution_and_nonuniform_spacing(self):
         agent = self.make_agent()
@@ -152,22 +155,22 @@ class ValueEnsembleTest(unittest.TestCase):
         bins = torch.tensor([-3.0, -1.0, 4.0])
         left = TwoHot(torch.tensor([0.5, 0.5, 0.0]).log().expand(2, 4, -1), bins)
         right = TwoHot(torch.tensor([0.0, 0.5, 0.5]).log().expand(2, 4, -1), bins)
-        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(3.5))
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.full((2, 3, 1), 3.5))
         # Equal means do not imply equal distributions: each half travels a distance of 2.
         bins = torch.tensor([-2.0, 0.0, 2.0])
         spread = TwoHot(torch.tensor([0.5, 0.0, 0.5]).log().expand(2, 4, -1), bins)
         center = TwoHot(torch.tensor([0.0, 1.0, 0.0]).log().expand(2, 4, -1), bins)
         torch.testing.assert_close(spread.mode(), center.mode())
-        torch.testing.assert_close(agent._imag_wasserstein([spread, center]), torch.tensor(2.0))
+        torch.testing.assert_close(agent._imag_wasserstein([spread, center]), torch.full((2, 3, 1), 2.0))
 
     def test_wasserstein_averages_all_unordered_pairs(self):
         agent = self.make_agent()
         bins = torch.tensor([-3.0, -1.0, 0.0, 4.0, 10.0])
         dists = [TwoHot(prob.log().expand(2, 4, -1), bins) for prob in torch.eye(5)]
         # The ten distances are 2, 3, 7, 13, 1, 5, 11, 4, 10, 6; their sum is 62.
-        torch.testing.assert_close(agent._imag_wasserstein(dists), torch.tensor(6.2))
+        torch.testing.assert_close(agent._imag_wasserstein(dists), torch.full((2, 3, 1), 6.2))
         permuted = [dists[i] for i in [3, 0, 4, 1, 2]]
-        torch.testing.assert_close(agent._imag_wasserstein(permuted), torch.tensor(6.2))
+        torch.testing.assert_close(agent._imag_wasserstein(permuted), torch.full((2, 3, 1), 6.2))
 
     def test_wasserstein_averages_states_and_excludes_bootstrap(self):
         agent = self.make_agent()
@@ -175,11 +178,13 @@ class ValueEnsembleTest(unittest.TestCase):
         left = TwoHot(torch.tensor([1.0, 0.0]).log().expand(2, 3, -1), bins)
         probabilities = torch.tensor([[[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0]] * 3])
         right = TwoHot(probabilities.log(), bins)
-        # Distances at the four included positions are 4, 0, 4, 4.
-        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(3.0))
+        # Distances retain both the trajectory and time axes; only head pairs are averaged.
+        expected = torch.tensor([[[4.0], [0.0]], [[4.0], [4.0]]])
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), expected)
+        torch.testing.assert_close(expected.mean(dim=0), torch.tensor([[4.0], [2.0]]))
         probabilities[:, -1] = torch.tensor([1.0, 0.0])
         right = TwoHot(probabilities.log(), bins)
-        torch.testing.assert_close(agent._imag_wasserstein([left, right]), torch.tensor(3.0))
+        torch.testing.assert_close(agent._imag_wasserstein([left, right]), expected)
 
     def test_wasserstein_is_detached_float32_under_autocast(self):
         agent = self.make_agent()
@@ -191,9 +196,9 @@ class ValueEnsembleTest(unittest.TestCase):
             dists = [TwoHot(logits.expand(2, 4, -1), bins) for logits in [left_logits, right_logits]]
             metric = agent._imag_wasserstein(dists)
         self.assertEqual(metric.dtype, torch.float32)
-        self.assertEqual(metric.ndim, 0)
+        self.assertEqual(metric.shape, (2, 3, 1))
         self.assertFalse(metric.requires_grad)
-        torch.testing.assert_close(metric, torch.tensor(120000.0))
+        torch.testing.assert_close(metric, torch.full((2, 3, 1), 120000.0))
         self.assertIsNone(left_logits.grad)
         self.assertIsNone(right_logits.grad)
 
@@ -202,7 +207,7 @@ class ValueEnsembleTest(unittest.TestCase):
         data, initial = self.make_batch(agent)
         state = {name: value.clone() for name, value in agent.state_dict().items()}
         torch.manual_seed(29)
-        with mock.patch.object(agent, "_imag_wasserstein", return_value=torch.tensor(0.0)):
+        with mock.patch.object(agent, "_imag_wasserstein", return_value=torch.zeros(8, 3, 1)):
             _, reference = agent._cal_grad(data, initial)
         losses = {key: value.detach().clone() for key, value in reference.items() if "loss" in key}
         grads = {name: None if p.grad is None else p.grad.clone() for name, p in agent._named_params.items()}
@@ -214,11 +219,11 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertEqual(value_loss.call_count, 2)
         imag_dists = value_loss.call_args_list[0].args[0]
         self.assertEqual(len(imag_dists), 5)
-        torch.testing.assert_close(metrics["imag_wasser"], agent._imag_wasserstein(imag_dists))
-        self.assertEqual(metrics["imag_wasser"].ndim, 0)
+        torch.testing.assert_close(metrics["imag_wasser"], agent._imag_wasserstein(imag_dists).mean(dim=0))
+        self.assertEqual(metrics["imag_wasser"].shape, (3, 1))
         self.assertFalse(metrics["imag_wasser"].requires_grad)
-        self.assertTrue(torch.isfinite(metrics["imag_wasser"]))
-        self.assertGreater(metrics["imag_wasser"].item(), 0)
+        self.assertTrue(torch.isfinite(metrics["imag_wasser"]).all())
+        self.assertGreater(metrics["imag_wasser"].mean().item(), 0)
         self.assertNotIn("img_wasser", metrics)
         for key, value in losses.items():
             torch.testing.assert_close(metrics[key], value, rtol=0, atol=0)
@@ -245,6 +250,103 @@ class ValueEnsembleTest(unittest.TestCase):
                 for module in [agent.rssm._img_net, agent.reward, agent.cont, agent.decoder, agent._slow_value]:
                     self.assertEqual(self.grad_norm(module), 0)
                 self.assert_frozen_sharing(agent)
+
+    def test_dynamic_threshold_curve_masks_and_return_normalization(self):
+        agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=1)
+        agent.dynamic_trunc_quantile = 0.5
+        agent.dynamic_trunc_threshold_scale = 2.0
+        data, initial = self.make_batch(agent)
+        scores = torch.arange(1, 9, dtype=torch.float32)[:, None, None] + torch.tensor([0.0, 10.0, 20.0])[None, :, None]
+        scores[0, 1:] = 0
+        expected_mask = torch.zeros(8, 3, 1, dtype=torch.bool)
+        expected_mask[:, 0] = True
+        expected_mask[0] = True
+        with (
+            mock.patch.object(agent, "_imag_wasserstein", return_value=scores),
+            mock.patch.object(agent.trunc_kappa, "forward", wraps=agent.trunc_kappa.forward) as threshold_call,
+            mock.patch.object(agent, "_value_loss", wraps=agent._value_loss) as value_loss,
+            mock.patch.object(agent, "_lambda_return", wraps=agent._lambda_return) as returns,
+        ):
+            _, metrics = agent._cal_grad(data, initial)
+        threshold_call.assert_called_once()
+        torch.testing.assert_close(metrics["dynamic_trunc/threshold_raw"], torch.tensor(9.0))
+        torch.testing.assert_close(metrics["dynamic_trunc/threshold"], torch.tensor(9.0))
+        torch.testing.assert_close(metrics["imag_wasser"], torch.tensor([[4.5], [13.125], [21.875]]))
+        torch.testing.assert_close(metrics["dynamic_trunc/keep_rate"], expected_mask.float().mean())
+        torch.testing.assert_close(metrics["dynamic_trunc/effective_horizon"], torch.tensor(1.25))
+        imag_loss_args = value_loss.call_args_list[0].args
+        loss_mask = imag_loss_args[4]
+        torch.testing.assert_close(loss_mask, expected_mask.float() * 2.4)
+        self.assertEqual(len(value_loss.call_args_list[1].args), 4)  # Replay does not receive the imagination mask.
+        imag_ret = imag_loss_args[1][:, :-1]
+        imag_value = returns.call_args_list[0].args[3]
+        stats = torch.where(expected_mask, imag_ret, imag_value[:, :-1])
+        expected_ema = agent.return_ema.alpha * torch.quantile(stats.flatten(), agent.return_ema.range)
+        torch.testing.assert_close(agent.return_ema.ema_vals, expected_ema)
+        agent.zero_grad(set_to_none=True)
+        with mock.patch.object(agent, "_imag_wasserstein", return_value=scores * 2):
+            _, next_metrics = agent._cal_grad(data, initial)
+        torch.testing.assert_close(next_metrics["dynamic_trunc/threshold_raw"], torch.tensor(18.0))
+        torch.testing.assert_close(next_metrics["dynamic_trunc/threshold"], torch.tensor(9.0))
+        torch.testing.assert_close(agent.trunc_kappa.value, torch.tensor(9.009))
+        self.assertFalse(agent.trunc_kappa.value.requires_grad)
+
+    def test_dynamic_gradient_boundaries_on_a_partial_prefix(self):
+        for active in ["policy", "value", "repval"]:
+            with self.subTest(loss=active):
+                agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=1)
+                agent._loss_scales = {key: float(key == active) for key in agent._loss_scales}
+                data, initial = self.make_batch(agent)
+                scores = torch.tensor([0.0, 2.0, 0.0]).reshape(1, 3, 1).expand(8, -1, -1)
+                with mock.patch.object(agent, "_imag_wasserstein", return_value=scores):
+                    agent._cal_grad(data, initial)
+                self.assertEqual(self.grad_norm(agent.actor) > 0, active == "policy")
+                for head in agent.value:
+                    self.assertEqual(self.grad_norm(head) > 0, active in ["value", "repval"])
+                for module in [agent.encoder, agent.rssm._obs_net, agent.rssm._deter_net]:
+                    self.assertEqual(self.grad_norm(module) > 0, active == "repval")
+                for module in [agent.rssm._img_net, agent.reward, agent.cont, agent.decoder, agent._slow_value]:
+                    self.assertEqual(self.grad_norm(module), 0)
+                self.assert_frozen_sharing(agent)
+
+    def test_empty_mask_removes_imagined_losses_but_keeps_replay_learning(self):
+        agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=0)
+        agent.dynamic_trunc_threshold_scale = 0.5
+        agent._loss_scales = {key: float(key == "repval") for key in agent._loss_scales}
+        data, initial = self.make_batch(agent)
+        with mock.patch.object(agent, "_imag_wasserstein", return_value=torch.ones(8, 3, 1)):
+            _, metrics = agent._cal_grad(data, initial)
+        self.assertEqual(metrics["dynamic_trunc/keep_rate"].item(), 0)
+        self.assertEqual(metrics["loss/policy"].item(), 0)
+        self.assertEqual(metrics["loss/value"].item(), 0)
+        self.assertGreater(metrics["loss/repval"].item(), 0)
+        self.assertGreater(self.grad_norm(agent.encoder), 0)
+        for head in agent.value:
+            self.assertGreater(self.grad_norm(head), 0)
+        self.assertEqual(self.grad_norm(agent.actor), 0)
+
+    def test_value_mask_blocks_each_members_feature_gradients(self):
+        agent = self.make_agent(outscale=0.1)
+        feat = torch.randn(2, 4, agent.rssm.feat_size, requires_grad=True)
+        target = torch.zeros(2, 4, 1)
+        slow = torch.zeros(5, 2, 4, 1)
+        mask = torch.tensor([[[1.0], [0.0], [0.0]], [[1.0], [1.0], [0.0]]])
+        dists = [head(feat) for head in agent.value]
+        agent._value_loss(dists, target, slow, torch.ones_like(target), mask).backward()
+        self.assertEqual(feat.grad[0, 1:].abs().sum().item(), 0)
+        self.assertEqual(feat.grad[1, 2:].abs().sum().item(), 0)
+        self.assertGreater(feat.grad[0, 0].abs().sum().item(), 0)
+        for head in agent.value:
+            self.assertGreater(self.grad_norm(head), 0)
+
+    def test_zero_initialized_heads_keep_full_horizon(self):
+        agent = self.make_agent(trunc_enabled=True, min_horizon=1)
+        data, initial = self.make_batch(agent)
+        _, metrics = agent._cal_grad(data, initial)
+        torch.testing.assert_close(metrics["imag_wasser"], torch.zeros(3, 1))
+        self.assertEqual(metrics["dynamic_trunc/threshold"].item(), 0)
+        self.assertEqual(metrics["dynamic_trunc/keep_rate"].item(), 1)
+        self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 3)
 
     def test_one_random_pair_is_shared_by_bootstrap_and_advantage(self):
         agent = self.make_agent(outscale=0.1)
@@ -303,7 +405,7 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assert_frozen_sharing(agent.to("cpu"))
 
     def test_update_and_checkpoint_roundtrip(self):
-        agent = self.make_agent(size=2)
+        agent = self.make_agent(size=2, trunc_enabled=True)
         data, initial = self.make_batch(agent)
         replay = mock.Mock()
         replay.sample.side_effect = lambda: (data.clone(), "indices", initial)
@@ -322,7 +424,7 @@ class ValueEnsembleTest(unittest.TestCase):
         torch.save({"agent": agent.state_dict(), "optimizer": agent._optimizer.state_dict()}, checkpoint)
         checkpoint.seek(0)
         state = torch.load(checkpoint, weights_only=True)
-        restored = self.make_agent(size=2)
+        restored = self.make_agent(size=2, trunc_enabled=True)
         restored.load_state_dict(state["agent"])
         restored._optimizer.load_state_dict(state["optimizer"])
         for name, value in restored.state_dict().items():
@@ -330,6 +432,7 @@ class ValueEnsembleTest(unittest.TestCase):
         for param in restored.value.parameters():
             self.assertEqual(restored._optimizer.state[param]["step"], 2)
         self.assert_frozen_sharing(restored)
+        self.assertTrue(restored.trunc_kappa.initialized)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,20 @@ Each update samples two heads whose mean predicts imagination bootstrap values a
 advantage baseline. All heads train on the same return targets, with a separate slow
 target per head; their losses are averaged before backpropagation.
 
+Dynamic imagination truncation is enabled by default. Each trajectory uses its
+current-state value distributions' mean pairwise Wasserstein-1 disagreement, a
+lagged EMA of the first-step 95th percentile (decay 0.999), and a minimum of 8 steps.
+Returns bootstrap at the truncation boundary; actor and imagined value losses use
+the retained prefix. To use the full imagination horizon:
+
+```bash
+python3 train.py model.rep_loss=dreamer model.dynamic_trunc.enabled=false
+```
+
+`train/imag_wasser` in `metrics.jsonl` is an `[H, 1]` array averaged over imagination
+starts. TensorBoard records each depth as `train/imag_wasser/step_00`, `step_01`, etc.
+The scalar `train/dynamic_trunc/effective_horizon` reports the mean retained length.
+
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
 
