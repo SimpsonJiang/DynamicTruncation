@@ -4,12 +4,15 @@ set -euo pipefail
 # ==== Settings ====
 DATE=$(date +%m%d) # auto complete
 MODAL=proprio # vision/proprio
-METHOD=VE # Value Ensemble
+METHOD=baseline # Value Ensemble
 CONDA_ENV=r2dreamer
 
+enable_dny_trunc=false
+val_ens_num=1
+
 GPU_IDs=(
-    0
-    1
+    6
+    7
 )
 seeds=(
     1
@@ -80,6 +83,8 @@ train_job() {
             device=cuda:0 \
             buffer.storage_device=cuda:0 \
             model.rep_loss=dreamer \
+            "model.dynamic_trunc.enabled=${enable_dny_trunc}" \
+            "model.value_ensemble_size=${val_ens_num}" \
             "seed=$seed"; then
         printf '[GPU %s] Finished task=%s seed=%s\n' "$GPU_ID" "$task" "$seed"
     else
@@ -110,6 +115,8 @@ for gpu_index in "${!GPU_IDs[@]}"; do
         printf 'source %q\nconda activate %q\n' "$CONDA_SH" "$CONDA_ENV"
         printf 'GPU_ID=%q\nPYTHON=%q\nMODAL=%q\nMETHOD=%q\nDATE=%q\nFAILED=0\n' \
             "$gpu" "$PYTHON" "$MODAL" "$METHOD" "$DATE"
+        printf 'enable_dny_trunc=%q\nval_ens_num=%q\n' \
+            "$enable_dny_trunc" "$val_ens_num"
         declare -f train_job
     } > "$worker"
 
@@ -128,6 +135,29 @@ for gpu_index in "${!GPU_IDs[@]}"; do
     printf 'printf "\\n[GPU %%s] All assigned jobs completed; failure flag=%%s\\n" "$GPU_ID" "$FAILED"\nexit "$FAILED"\n' >> "$worker"
 done
 
+# Keep finished GPU windows until every worker exits, then remove this session.
+cleanup="$WORKER_DIR/cleanup.sh"
+{
+    printf '#!/bin/bash\nset -euo pipefail\nSESSION=%q\n' "$SESSION"
+    cat <<'CLEANUP'
+while tmux has-session -t "=$SESSION" 2>/dev/null; do
+    panes=$(tmux list-panes -s -t "=$SESSION" -F '#{window_name} #{pane_dead}') || exit 0
+    running=false
+    while read -r name dead; do
+        if [[ $name == gpu_* && $dead == 0 ]]; then
+            running=true
+            break
+        fi
+    done <<< "$panes"
+    if [[ $running == false ]]; then
+        tmux kill-session -t "=$SESSION"
+        exit 0
+    fi
+    sleep 2
+done
+CLEANUP
+} > "$cleanup"
+
 # Prepare a window per GPU, then start all workers without waiting for training.
 tmux new-session -d -s "$SESSION" -n "gpu_${GPU_IDs[0]}" -c "$SCRIPT_DIR" "$BASH"
 for gpu_index in "${!GPU_IDs[@]}"; do
@@ -141,8 +171,9 @@ done
 for gpu in "${GPU_IDs[@]}"; do
     tmux respawn-window -k -t "$SESSION:gpu_$gpu" "$BASH" "$WORKER_DIR/gpu_${gpu}.sh"
 done
+tmux new-window -d -t "$SESSION:" -n cleanup -c "$SCRIPT_DIR" "$BASH" "$cleanup"
 printf '\nStarted tmux session: %s\nAttach: tmux attach -t %s\n' "$SESSION" "$SESSION"
-printf 'Worker scripts: %s\nCompleted windows remain available for inspection.\n' "$WORKER_DIR"
+printf 'Worker scripts: %s\nThis session will be deleted automatically after all GPU workers exit.\n' "$WORKER_DIR"
 
 # ==== Tasks ====
 # tasks=(
