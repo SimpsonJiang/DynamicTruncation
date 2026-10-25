@@ -34,12 +34,17 @@ class Dreamer(nn.Module):
         if (
             isinstance(self.value_ensemble_size, bool)
             or not isinstance(self.value_ensemble_size, int)
-            or self.value_ensemble_size < 2
+            or self.value_ensemble_size < 1
         ):
-            raise ValueError("model.value_ensemble_size must be an integer of at least 2")
+            raise ValueError("model.value_ensemble_size must be a positive integer")
 
         trunc = config.get("dynamic_trunc", {})
         self.dynamic_trunc_enabled = bool(trunc.get("enabled", True))
+        if self.dynamic_trunc_enabled and self.value_ensemble_size < 2:
+            raise ValueError(
+                "Dynamic truncation requires at least 2 value heads; "
+                "set model.dynamic_trunc.enabled=false for a single-head baseline"
+            )
         self.dynamic_trunc_quantile = float(trunc.get("quantile", 0.95))
         self.dynamic_trunc_threshold_scale = float(trunc.get("threshold_scale", 1.0))
         self.dynamic_trunc_min_horizon = trunc.get("min_horizon", 8)
@@ -480,10 +485,13 @@ class Dreamer(nn.Module):
         # (value_ensemble_size, B*T, T_imag, 1)
         imag_values = torch.stack([head(imag_feat).mode() for head in self._frozen_value])
         imag_slow_values = torch.stack([head(imag_feat).mode() for head in self._frozen_slow_value])
-        # One pair per update, shared by the whole batch, time axis, bootstrap, and advantage.
-        value_pair = torch.randperm(self.value_ensemble_size, device=imag_feat.device)[:2]
-        # (B*T, T_imag, 1): average scalar predictions, not distribution logits.
-        imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
+        if self.value_ensemble_size == 1:
+            imag_value = imag_values[0]
+        else:
+            # One pair per update, shared by batch, time, bootstrap, and advantage.
+            value_pair = torch.randperm(self.value_ensemble_size, device=imag_feat.device)[:2]
+            # (B*T, T_imag, 1): average scalar predictions, not distribution logits.
+            imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
         imag_value_dist = [head(imag_feat) for head in self.value]
         # (B*T, H, 1): each trajectory gates on its own current-state disagreement.
         imag_uncertainty = self._imag_wasserstein(imag_value_dist)
@@ -595,6 +603,9 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def _imag_wasserstein(self, value_dists):
         """Per-state mean pairwise W1, shape (B*T, H, 1), excluding the final bootstrap state."""
+        if len(value_dists) == 1:
+            # A single member has no pairwise disagreement.
+            return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
         # Each CDF has shape (B*T, T_imag-1, num_bins-1); all heads share the same bins.
         cdfs = [to_f32(dist.probs.detach()[:, :-1]).cumsum(dim=-1)[..., :-1] for dist in value_dists]
         widths = to_f32(value_dists[0].bins.detach()).diff()

@@ -33,7 +33,7 @@ Switching algorithms:
 python3 train.py model.rep_loss=r2dreamer
 ```
 
-The value ensemble defaults to 5 independent heads and requires at least 2. For example:
+The value ensemble defaults to 5 independent heads. For example:
 
 ```bash
 python3 train.py model.rep_loss=dreamer model.value_ensemble_size=5
@@ -52,6 +52,10 @@ the retained prefix. To use the full imagination horizon:
 ```bash
 python3 train.py model.rep_loss=dreamer model.dynamic_trunc.enabled=false
 ```
+
+For a single-head baseline, also set `model.value_ensemble_size=1`. This uses the
+single head directly for bootstrap and advantage, and logs zero disagreement.
+Dynamic truncation requires at least two heads.
 
 `train/imag_wasser` in `metrics.jsonl` is an `[H, 1]` array averaged over imagination
 starts. TensorBoard records each depth as `train/imag_wasser/step_00`, `step_01`, etc.

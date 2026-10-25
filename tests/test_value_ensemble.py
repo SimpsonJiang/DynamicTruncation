@@ -53,6 +53,8 @@ class ValueEnsembleTest(unittest.TestCase):
         config.dynamic_trunc.min_horizon = min_horizon
         with contextlib.redirect_stdout(io.StringIO()):
             agent = Dreamer(config, self.obs_space, self.act_space).to("cpu")
+        # CPU unit tests must not depend on whether this host exposes CUDA.
+        agent._scaler = torch.amp.GradScaler("cpu", enabled=False)
         return agent
 
     def make_batch(self, agent):
@@ -110,9 +112,39 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assert_frozen_sharing(agent)
 
     def test_invalid_member_counts(self):
-        for size in [0, 1, -2, 2.5, "5", True]:
+        for size in [0, -2, 2.5, "5", True]:
             with self.subTest(size=size), self.assertRaisesRegex(ValueError, "value_ensemble_size"):
                 self.make_agent(size=size)
+
+    def test_single_head_requires_disabled_truncation(self):
+        with self.assertRaisesRegex(ValueError, "Dynamic truncation requires at least 2"):
+            self.make_agent(size=1, trunc_enabled=True)
+
+    def test_single_head_bootstrap_and_finite_zero_disagreement(self):
+        agent = self.make_agent(size=1, outscale=0.1)
+        data, initial = self.make_batch(agent)
+        predictions = []
+        hook = agent._frozen_value[0].register_forward_hook(
+            lambda module, args, dist: predictions.append(dist.mode().detach())
+        )
+        try:
+            with (
+                mock.patch("dreamer.torch.randperm", side_effect=AssertionError("Single head must not sample a pair")),
+                mock.patch.object(agent, "_lambda_return", wraps=agent._lambda_return) as returns,
+            ):
+                _, metrics = agent._cal_grad(data, initial)
+        finally:
+            hook.remove()
+        imag_args = returns.call_args_list[0].args
+        torch.testing.assert_close(imag_args[3], predictions[0])
+        torch.testing.assert_close(imag_args[4], predictions[0])
+        torch.testing.assert_close(metrics["imag_wasser"], torch.zeros(3, 1))
+        self.assertEqual(metrics["imag_wasser"].dtype, torch.float32)
+        self.assertFalse(metrics["imag_wasser"].requires_grad)
+        self.assertEqual(metrics["value_ensemble_std"].item(), 0)
+        self.assertEqual(metrics["value_ensemble_std_replay"].item(), 0)
+        self.assertTrue(all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values()))
+        self.assertFalse(any(key.startswith("dynamic_trunc/") for key in metrics))
 
     def test_loss_matches_categorical_targets_and_averages_member_gradients(self):
         agent = self.make_agent(outscale=0.1)
@@ -234,10 +266,10 @@ class ValueEnsembleTest(unittest.TestCase):
                 torch.testing.assert_close(param.grad, grads[name], rtol=0, atol=0)
 
     def test_loss_gradient_boundaries(self):
-        for active in ["policy", "value", "repval"]:
-            with self.subTest(loss=active):
+        for size, active in [(size, loss) for size in (1, 5) for loss in ("policy", "value", "repval")]:
+            with self.subTest(size=size, loss=active):
                 # Nonzero output weights exercise upstream gradients beyond the initial zero-output step.
-                agent = self.make_agent(outscale=0.1)
+                agent = self.make_agent(size=size, outscale=0.1)
                 agent._loss_scales = {key: float(key == active) for key in agent._loss_scales}
                 data, initial = self.make_batch(agent)
                 agent._cal_grad(data, initial)
@@ -405,7 +437,12 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assert_frozen_sharing(agent.to("cpu"))
 
     def test_update_and_checkpoint_roundtrip(self):
-        agent = self.make_agent(size=2, trunc_enabled=True)
+        for size in (1, 2):
+            with self.subTest(size=size):
+                self._check_update_and_checkpoint_roundtrip(size)
+
+    def _check_update_and_checkpoint_roundtrip(self, size):
+        agent = self.make_agent(size=size, trunc_enabled=size > 1)
         data, initial = self.make_batch(agent)
         replay = mock.Mock()
         replay.sample.side_effect = lambda: (data.clone(), "indices", initial)
@@ -424,7 +461,7 @@ class ValueEnsembleTest(unittest.TestCase):
         torch.save({"agent": agent.state_dict(), "optimizer": agent._optimizer.state_dict()}, checkpoint)
         checkpoint.seek(0)
         state = torch.load(checkpoint, weights_only=True)
-        restored = self.make_agent(size=2, trunc_enabled=True)
+        restored = self.make_agent(size=size, trunc_enabled=size > 1)
         restored.load_state_dict(state["agent"])
         restored._optimizer.load_state_dict(state["optimizer"])
         for name, value in restored.state_dict().items():
@@ -432,7 +469,10 @@ class ValueEnsembleTest(unittest.TestCase):
         for param in restored.value.parameters():
             self.assertEqual(restored._optimizer.state[param]["step"], 2)
         self.assert_frozen_sharing(restored)
-        self.assertTrue(restored.trunc_kappa.initialized)
+        if size > 1:
+            self.assertTrue(restored.trunc_kappa.initialized)
+        else:
+            self.assertIsNone(restored.trunc_kappa)
 
 
 if __name__ == "__main__":
