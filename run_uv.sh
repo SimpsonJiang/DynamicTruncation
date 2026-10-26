@@ -40,6 +40,14 @@ PYTHON=$(command -v python) || { echo "Error: python is required." >&2; exit 1; 
 printf 'uv environment: %s (Python: %s)\n' "$UV_ACTIVATE" "$PYTHON"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
+# Keep compilation artifacts and temporary files off a potentially full /tmp.
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$SCRIPT_DIR/.cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$SCRIPT_DIR/.cache/triton}"
+export TMPDIR="${TMPDIR:-$SCRIPT_DIR/.cache/tmp}"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR"
+printf 'Inductor cache: %s\nTriton cache: %s\nTemporary directory: %s\n' \
+    "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR"
+
 if (( ${#GPU_IDs[@]} == 0 || ${#tasks[@]} == 0 || ${#seeds[@]} == 0 )); then
     echo "Error: GPU_IDs, tasks and seeds must all be non-empty." >&2
     exit 1
@@ -88,7 +96,7 @@ train_job() {
     fi
 }
 
-WORKER_DIR=$(mktemp -d /tmp/r2dreamer-workers.XXXXXX)
+WORKER_DIR=$(mktemp -d "${TMPDIR%/}/r2dreamer-workers.XXXXXX")
 SESSION="r2dreamer_${DATE}_$(date +%H%M%S)_$$"
 gpu_count=${#GPU_IDs[@]}
 total_jobs=$(( ${#tasks[@]} * ${#seeds[@]} ))
@@ -114,7 +122,8 @@ for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
         printf '#!/bin/bash\nset -euo pipefail\n'
         printf 'cd -- %q\n' "$SCRIPT_DIR"
         # Restore caller settings, then activate the uv environment in this worker.
-        for name in PATH LD_LIBRARY_PATH PYTHONPATH VIRTUAL_ENV https_proxy http_proxy all_proxy no_proxy; do
+        for name in PATH LD_LIBRARY_PATH PYTHONPATH VIRTUAL_ENV https_proxy http_proxy all_proxy no_proxy \
+            TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR TMPDIR; do
             if [[ -v $name ]]; then
                 printf 'export %s=%q\n' "$name" "${!name}"
             fi
