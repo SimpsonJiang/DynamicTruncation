@@ -6,18 +6,18 @@ DATE=$(date +%m%d) # auto complete
 MODAL=proprio # vision/proprio
 
 CONDA_ENV=r2dreamer
-PROCS_PER_GPU=1 # Maximum concurrent training jobs on each GPU.
+PROCS_PER_GPU=2 # Maximum concurrent training jobs on each GPU.
 
 enable_dny_trunc=true
 val_ens_num=5
-VE_metric=ucb
+VE_metric=wasser
 #wasser, ucb
-imag_hori=15
+imag_hori=32
 METHOD=VE_${VE_metric}_H${imag_hori} # Value Ensemble
 
 GPU_IDs=(
-    6
-    7
+    4
+    5
 )
 seeds=(
     1
