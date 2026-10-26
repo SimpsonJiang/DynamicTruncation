@@ -4,11 +4,16 @@ set -euo pipefail
 # ==== Settings ====
 DATE=$(date +%m%d) # auto complete
 MODAL=proprio # vision/proprio
-METHOD=baseline # Value Ensemble
-CONDA_ENV=r2dreamer
 
-enable_dny_trunc=false
-val_ens_num=1
+CONDA_ENV=r2dreamer
+PROCS_PER_GPU=1 # Maximum concurrent training jobs on each GPU.
+
+enable_dny_trunc=true
+val_ens_num=5
+VE_metric=ucb
+#wasser, ucb
+imag_hori=15
+METHOD=VE_${VE_metric}_H${imag_hori} # Value Ensemble
 
 GPU_IDs=(
     6
@@ -56,6 +61,10 @@ if (( ${#GPU_IDs[@]} == 0 || ${#tasks[@]} == 0 || ${#seeds[@]} == 0 )); then
     echo "Error: GPU_IDs, tasks and seeds must all be non-empty." >&2
     exit 1
 fi
+if [[ ! $PROCS_PER_GPU =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: PROCS_PER_GPU must be a positive integer." >&2
+    exit 1
+fi
 declare -A seen_gpus=()
 for gpu in "${GPU_IDs[@]}"; do
     if [[ ! $gpu =~ ^[0-9]+$ || -n ${seen_gpus[$gpu]:-} ]]; then
@@ -85,6 +94,8 @@ train_job() {
             model.rep_loss=dreamer \
             "model.dynamic_trunc.enabled=${enable_dny_trunc}" \
             "model.value_ensemble_size=${val_ens_num}" \
+            "model.VE_metric=${VE_metric}" \
+            "model.imag_horizon=${imag_hori}" \
             "seed=$seed"; then
         printf '[GPU %s] Finished task=%s seed=%s\n' "$GPU_ID" "$task" "$seed"
     else
@@ -98,11 +109,24 @@ WORKER_DIR=$(mktemp -d /tmp/r2dreamer-workers.XXXXXX)
 SESSION="r2dreamer_${DATE}_$(date +%H%M%S)_$$"
 gpu_count=${#GPU_IDs[@]}
 total_jobs=$(( ${#tasks[@]} * ${#seeds[@]} ))
+worker_count=$(( gpu_count * PROCS_PER_GPU ))
+if (( worker_count > total_jobs )); then
+    worker_count=$total_jobs
+fi
+worker_names=()
 
-printf 'Distributing %s jobs across %s GPUs (GPUs run in parallel):\n' "$total_jobs" "$gpu_count"
-for gpu_index in "${!GPU_IDs[@]}"; do
+printf 'Distributing %s jobs across %s GPUs, up to %s concurrent jobs per GPU (%s workers):\n' \
+    "$total_jobs" "$gpu_count" "$PROCS_PER_GPU" "$worker_count"
+for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
+    gpu_index=$(( worker_index % gpu_count ))
     gpu=${GPU_IDs[$gpu_index]}
-    worker="$WORKER_DIR/gpu_${gpu}.sh"
+    slot=$(( worker_index / gpu_count + 1 ))
+    worker_name="gpu_${gpu}"
+    if (( PROCS_PER_GPU > 1 )); then
+        worker_name+="_worker_${slot}"
+    fi
+    worker_names+=("$worker_name")
+    worker="$WORKER_DIR/${worker_name}.sh"
     {
         printf '#!/bin/bash\nset -euo pipefail\n'
         printf 'cd -- %q\n' "$SCRIPT_DIR"
@@ -117,15 +141,17 @@ for gpu_index in "${!GPU_IDs[@]}"; do
             "$gpu" "$PYTHON" "$MODAL" "$METHOD" "$DATE"
         printf 'enable_dny_trunc=%q\nval_ens_num=%q\n' \
             "$enable_dny_trunc" "$val_ens_num"
+        printf 'VE_metric=%q\nimag_hori=%q\n' \
+            "$VE_metric" "$imag_hori"
         declare -f train_job
     } > "$worker"
 
-    assigned=$(( total_jobs / gpu_count + (gpu_index < total_jobs % gpu_count) ))
-    printf '\nGPU %s: %s jobs\n' "$gpu" "$assigned"
+    assigned=$(( total_jobs / worker_count + (worker_index < total_jobs % worker_count) ))
+    printf '\nGPU %s, worker %s: %s jobs\n' "$gpu" "$slot" "$assigned"
     job_index=0
     for task in "${tasks[@]}"; do
         for seed in "${seeds[@]}"; do
-            if (( job_index % gpu_count == gpu_index )); then
+            if (( job_index % worker_count == worker_index )); then
                 printf '  task=%s seed=%s\n' "$task" "$seed"
                 printf 'train_job %q %q\n' "$task" "$seed" >> "$worker"
             fi
@@ -158,18 +184,18 @@ done
 CLEANUP
 } > "$cleanup"
 
-# Prepare a window per GPU, then start all workers without waiting for training.
-tmux new-session -d -s "$SESSION" -n "gpu_${GPU_IDs[0]}" -c "$SCRIPT_DIR" "$BASH"
-for gpu_index in "${!GPU_IDs[@]}"; do
-    gpu=${GPU_IDs[$gpu_index]}
-    window="$SESSION:gpu_$gpu"
-    if (( gpu_index > 0 )); then
-        tmux new-window -d -t "$SESSION:" -n "gpu_$gpu" -c "$SCRIPT_DIR" "$BASH"
+# Prepare a window per concurrent worker before launching any training jobs.
+tmux new-session -d -s "$SESSION" -n "${worker_names[0]}" -c "$SCRIPT_DIR" "$BASH"
+for worker_index in "${!worker_names[@]}"; do
+    worker_name=${worker_names[$worker_index]}
+    window="$SESSION:$worker_name"
+    if (( worker_index > 0 )); then
+        tmux new-window -d -t "$SESSION:" -n "$worker_name" -c "$SCRIPT_DIR" "$BASH"
     fi
     tmux set-window-option -t "$window" remain-on-exit on
 done
-for gpu in "${GPU_IDs[@]}"; do
-    tmux respawn-window -k -t "$SESSION:gpu_$gpu" "$BASH" "$WORKER_DIR/gpu_${gpu}.sh"
+for worker_name in "${worker_names[@]}"; do
+    tmux respawn-window -k -t "$SESSION:$worker_name" "$BASH" "$WORKER_DIR/${worker_name}.sh"
 done
 tmux new-window -d -t "$SESSION:" -n cleanup -c "$SCRIPT_DIR" "$BASH" "$cleanup"
 printf '\nStarted tmux session: %s\nAttach: tmux attach -t %s\n' "$SESSION" "$SESSION"

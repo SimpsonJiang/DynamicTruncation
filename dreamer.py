@@ -37,6 +37,12 @@ class Dreamer(nn.Module):
             or self.value_ensemble_size < 1
         ):
             raise ValueError("model.value_ensemble_size must be a positive integer")
+        self.ve_metric = str(config.get("VE_metric", "wasser"))
+        if self.ve_metric not in ("wasser", "ucb"):
+            raise ValueError("model.VE_metric must be 'wasser' or 'ucb'")
+        self.ucb_beta = float(config.get("beta", 0.1))
+        if not math.isfinite(self.ucb_beta) or self.ucb_beta < 0:
+            raise ValueError("model.beta must be finite and non-negative")
 
         trunc = config.get("dynamic_trunc", {})
         self.dynamic_trunc_enabled = bool(trunc.get("enabled", True))
@@ -493,8 +499,11 @@ class Dreamer(nn.Module):
             # (B*T, T_imag, 1): average scalar predictions, not distribution logits.
             imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
         imag_value_dist = [head(imag_feat) for head in self.value]
-        # (B*T, H, 1): each trajectory gates on its own current-state disagreement.
-        imag_uncertainty = self._imag_wasserstein(imag_value_dist)
+        # (B*T, H, 1): each trajectory gates on its own current-state score.
+        if self.ve_metric == "wasser":
+            imag_uncertainty = self._imag_wasserstein(imag_value_dist)
+        else:
+            imag_uncertainty = self._imag_ucb(imag_values)
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
@@ -545,7 +554,8 @@ class Dreamer(nn.Module):
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_values)
         metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
-        metrics["imag_wasser"] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
+        uncertainty_metric = "imag_wasser" if self.ve_metric == "wasser" else "imag_ucb"
+        metrics[uncertainty_metric] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
@@ -599,6 +609,16 @@ class Dreamer(nn.Module):
             nll = -dist.log_prob(target) - dist.log_prob(slow_values[i].detach())
             losses.append(torch.mean(weight * nll[:, :-1].unsqueeze(-1)))
         return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def _imag_ucb(self, imag_values):
+        """Mean + beta * sample std over all heads, excluding the bootstrap state."""
+        # (heads, B*T, H, 1), using scalar predictions in raw return units.
+        values = to_f32(imag_values.detach()[:, :, :-1])
+        if values.shape[0] == 1:
+            return values[0]
+        std, mean = torch.std_mean(values, dim=0, unbiased=True)
+        return mean + self.ucb_beta * std
 
     @torch.no_grad()
     def _imag_wasserstein(self, value_dists):

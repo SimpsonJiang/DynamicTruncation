@@ -44,7 +44,7 @@ advantage baseline. All heads train on the same return targets, with a separate 
 target per head; their losses are averaged before backpropagation.
 
 Dynamic imagination truncation is enabled by default. Each trajectory uses its
-current-state value distributions' mean pairwise Wasserstein-1 disagreement, a
+current-state score selected by `model.VE_metric` (`wasser` by default), a
 lagged EMA of the first-step 95th percentile (decay 0.999), and a minimum of 8 steps.
 Returns bootstrap at the truncation boundary; actor and imagined value losses use
 the retained prefix. To use the full imagination horizon:
@@ -53,13 +53,46 @@ the retained prefix. To use the full imagination horizon:
 python3 train.py model.rep_loss=dreamer model.dynamic_trunc.enabled=false
 ```
 
-For a single-head baseline, also set `model.value_ensemble_size=1`. This uses the
-single head directly for bootstrap and advantage, and logs zero disagreement.
+`wasser` uses mean pairwise Wasserstein-1 distance on the raw return bins.
+`ucb` uses all heads' scalar value predictions and the sample standard deviation:
+
+\[
+\mu = \frac{1}{n}\sum_i V_i,\qquad
+\sigma = \sqrt{\frac{1}{n-1}\sum_i(V_i-\mu)^2},\qquad
+\mathrm{UCB} = \mu + \beta\sigma.
+\]
+
+This follows [ELVIS equations (14)-(15)](https://arxiv.org/html/2605.04709v1#S4.SS2).
+`model.beta` defaults to `0.1` and must be finite and non-negative. UCB replaces
+only the truncation score; it uses the same threshold EMA and prefix masks as W1.
+The score is detached float32 and receives no extra normalization or clipping.
+It includes the predicted value mean, so identical heads can have nonzero UCB.
+
+```bash
+python3 train.py model.rep_loss=dreamer model.VE_metric=ucb model.imag_horizon=30
+```
+
+For a single-head baseline, set `model.dynamic_trunc.enabled=false` and
+`model.value_ensemble_size=1`. This uses the single head directly for bootstrap
+and advantage. W1 is zero; UCB equals the
+single prediction (its standard deviation is defined as zero).
 Dynamic truncation requires at least two heads.
 
-`train/imag_wasser` in `metrics.jsonl` is an `[H, 1]` array averaged over imagination
-starts. TensorBoard records each depth as `train/imag_wasser/step_00`, `step_01`, etc.
+Only the selected score is computed and logged: `train/imag_wasser` or
+`train/imag_ucb` in `metrics.jsonl` is an `[H, 1]` array averaged over imagination
+starts, excluding the final bootstrap state. TensorBoard records each depth as
+`train/imag_wasser/step_00` or `train/imag_ucb/step_00`, `step_01`, etc.
 The scalar `train/dynamic_trunc/effective_horizon` reports the mean retained length.
+
+In `run.sh`, `VE_metric` and `imag_hori` are forwarded to each worker as
+`model.VE_metric` and `model.imag_horizon`. `beta` is read from the model config
+(`configs/model/_base_.yaml`), rather than overridden by the launch script. The existing
+`enable_dny_trunc` and `val_ens_num` settings continue to control truncation and
+head count.
+
+`PROCS_PER_GPU` in `run.sh` defaults to `1` and limits concurrent training jobs
+on each GPU. Set it to `2` to run up to two jobs per GPU. Each worker processes
+its assigned queue sequentially; the tmux session is deleted after all workers exit.
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 

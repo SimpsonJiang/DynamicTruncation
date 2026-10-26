@@ -1,0 +1,56 @@
+{
+  "status": "complete",
+  "review_date": "2026-10-26",
+  "timezone": "Asia/Shanghai",
+  "repository_revision": "2ff4ce7892d40f6d90aff2661d699a819a274d17",
+  "scope": "Baseline hyperparameter audit: current launcher, all baseline/VE saved configs, baseline training path, optimizer checkpoints, fixed local pre-ensemble reference, official main comparison",
+  "source_code_modified": false,
+  "existing_user_change_preserved": "run.sh adds imag_hori=15",
+  "existing_analysis_preserved": true,
+  "baseline_runs_checked": 9,
+  "VE_configs_checked": 9,
+  "checkpoints_metadata_checked": 9,
+  "training_run": false,
+  "policy_evaluation_run": false,
+  "environment_instantiated": false,
+  "validation": {
+    "existing_test_suite": "python -m unittest discover -s tests -p test_value_ensemble.py -v",
+    "tests_passed": 20,
+    "tests_failed": 0,
+    "elapsed_seconds": 4.618,
+    "core_files_ast_parsed": 9,
+    "pre_ensemble_equivalence": {
+      "reference_commit": "80ee48e",
+      "mode": "Small model, CPU FP32, compile disabled, identical initialization and sampling seeds",
+      "max_absolute_loss_difference": 0.0,
+      "max_absolute_gradient_difference": 0.0
+    },
+    "KL_example": {
+      "q_logits": [12, 0, -12, -24],
+      "p_logits": [-12, 0, 12, 24],
+      "free_nats": 0,
+      "unimix_ratio": 0.01,
+      "raw_logits_kl": 35.99985122680664,
+      "mixed_sampling_distribution_kl": 5.924054145812988
+    }
+  },
+  "conclusion": "Saved baseline configurations correctly select this repository's original single-head Dreamer baseline; no claim of exact official DreamerV3 protocol or training-performance reproduction.",
+  "confirmed_findings": [
+    "imag_hori shell variable is not passed to Hydra or generated workers; saved baseline uses YAML imag_horizon=15",
+    "rep_loss=dreamer alone retains current five-head/dynamic-truncation defaults; saved baseline explicitly overrides both",
+    "RSSM sampling applies unimix but KL uses raw logits; inherited from initial repository",
+    "rssm.initial=learned is stored but initialization remains zero; inherited from initial repository"
+  ],
+  "limitations": [
+    "No full CUDA FP16/compile parity test or training/evaluation run",
+    "Saved configurations do not identify a unique historical source revision",
+    "Official main references are mutable and not the authors' pinned experimental commit",
+    "Shell proxy connection refused; web tools supplied external primary sources",
+    "Effects of inherited differences on scores remain unverified"
+  ],
+  "artifacts": [
+    "analysis_outputs/baseline_hyperparameters/SUMMARY.md",
+    "analysis_outputs/baseline_hyperparameters/RISKS.md",
+    "analysis_outputs/baseline_hyperparameters/status.json"
+  ]
+}
