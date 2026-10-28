@@ -74,14 +74,19 @@ python3 train.py model.rep_loss=dreamer model.VE_metric=ucb model.imag_horizon=3
 
 For a single-head baseline, set `model.dynamic_trunc.enabled=false` and
 `model.value_ensemble_size=1`. This uses the single head directly for bootstrap
-and advantage. W1 is zero; UCB equals the
+and advantage. W1 and sigma are zero; UCB equals the
 single prediction (its standard deviation is defined as zero).
 Dynamic truncation requires at least two heads.
 
-Only the selected score is computed and logged: `train/imag_wasser` or
-`train/imag_ucb` in `metrics.jsonl` is an `[H, 1]` array averaged over imagination
-starts, excluding the final bootstrap state. TensorBoard records each depth as
-`train/imag_wasser/step_00` or `train/imag_ucb/step_00`, `step_01`, etc.
+`model.VE_metric=sigma` uses only the sample standard deviation of the heads'
+scalar values, in raw return units. It uses the same truncation mechanism;
+`model.beta` does not affect sigma.
+
+Only the selected score is computed and logged: `train/imag_wasser`,
+`train/imag_ucb`, or `train/imag_sigma` in `metrics.jsonl` is an `[H, 1]` array
+averaged over imagination starts, excluding the final bootstrap state.
+TensorBoard records each depth as `train/imag_wasser/step_00`,
+`train/imag_ucb/step_00`, or `train/imag_sigma/step_00`, `step_01`, etc.
 The scalar `train/dynamic_trunc/effective_horizon` reports the mean retained length.
 
 In `run.sh`, `VE_metric` and `imag_hori` are forwarded to each worker as

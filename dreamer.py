@@ -622,14 +622,14 @@ class Dreamer(nn.Module):
         std, mean = torch.std_mean(values, dim=0, unbiased=True)
         return mean + self.ucb_beta * std
 
+    @torch.no_grad()
     def _imag_sigma(self, imag_values):
-            """sample std over all heads, excluding the bootstrap state."""
-            # (heads, B*T, H, 1), using scalar predictions in raw return units.
-            values = to_f32(imag_values.detach()[:, :, :-1])
-            if values.shape[0] == 1:
-                return values[0]
-            std = torch.std(values, dim=0, unbiased=True)
-            return std
+        """Sample std over all heads, excluding the bootstrap state."""
+        # (heads, B*T, H, 1), using scalar predictions in raw return units.
+        values = to_f32(imag_values.detach()[:, :, :-1])
+        if values.shape[0] == 1:
+            return torch.zeros_like(values[0])
+        return torch.std(values, dim=0, unbiased=True)
 
     @torch.no_grad()
     def _imag_wasserstein(self, value_dists):

@@ -124,7 +124,7 @@ class ValueEnsembleTest(unittest.TestCase):
                 self.make_agent(size=size)
 
     def test_single_head_requires_disabled_truncation(self):
-        for metric in ("wasser", "ucb"):
+        for metric in ("wasser", "ucb", "sigma"):
             with (
                 self.subTest(metric=metric),
                 self.assertRaisesRegex(ValueError, "Dynamic truncation requires at least 2"),
@@ -174,47 +174,93 @@ class ValueEnsembleTest(unittest.TestCase):
         torch.testing.assert_close(single, torch.full((1, 1, 1), -60000.0))
         self.assertIsNone(values.grad)
 
+    def test_sigma_uses_sample_std_and_preserves_trajectory_and_depth(self):
+        agent = self.make_agent(metric="sigma", beta=9)
+        values = torch.tensor(
+            [
+                [[-1.0, 1.0, 100.0], [3.0, -3.0, 100.0]],
+                [[1.0, 5.0, -100.0], [3.0, -1.0, -100.0]],
+                [[3.0, 9.0, 500.0], [3.0, 1.0, 500.0]],
+            ]
+        ).unsqueeze(-1).requires_grad_()
+        expected = torch.tensor([[[2.0], [4.0]], [[0.0], [2.0]]])
+        score = agent._imag_sigma(values)
+        torch.testing.assert_close(score, expected)
+        torch.testing.assert_close(score.mean(dim=0), torch.tensor([[1.0], [3.0]]))
+        shifted = values.detach().clone() + 100
+        shifted[:, :, -1] *= 1000
+        torch.testing.assert_close(agent._imag_sigma(shifted), expected)
+        torch.testing.assert_close(agent._imag_sigma(torch.full_like(values, -4)), torch.zeros_like(expected))
+        self.assertEqual(score.dtype, torch.float32)
+        self.assertFalse(score.requires_grad)
+        self.assertIsNone(values.grad)
+
+    def test_sigma_single_head_is_zero_and_float16_is_reduced_in_float32(self):
+        agent = self.make_agent(size=1, metric="sigma")
+        values = torch.tensor([[-60000.0, 10.0], [60000.0, -10.0]], dtype=torch.float16).reshape(2, 1, 2, 1)
+        values.requires_grad_()
+        with torch.autocast(device_type="cpu", dtype=torch.float16):
+            score = agent._imag_sigma(values)
+            single = agent._imag_sigma(values[:1])
+        torch.testing.assert_close(score, torch.full((1, 1, 1), 60000 * 2**0.5))
+        torch.testing.assert_close(single, torch.zeros(1, 1, 1))
+        for result in (score, single):
+            self.assertEqual(result.dtype, torch.float32)
+            self.assertFalse(result.requires_grad)
+            self.assertTrue(torch.isfinite(result).all())
+        self.assertIsNone(values.grad)
+
     def test_metric_switch_without_truncation_preserves_losses_gradients_and_rng(self):
         wasser = self.make_agent(outscale=0.1)
         ucb = self.make_agent(outscale=0.1, metric="ucb", beta=2)
+        sigma = self.make_agent(outscale=0.1, metric="sigma")
         ucb.load_state_dict(wasser.state_dict(), strict=True)
+        sigma.load_state_dict(wasser.state_dict(), strict=True)
         data, initial = self.make_batch(wasser)
         results = []
-        for agent, unused in ((wasser, "_imag_ucb"), (ucb, "_imag_wasserstein")):
+        methods = {"wasser": "_imag_wasserstein", "ucb": "_imag_ucb", "sigma": "_imag_sigma"}
+        for agent in (wasser, ucb, sigma):
             torch.manual_seed(43)
-            with (
-                mock.patch.object(agent, unused, side_effect=AssertionError("Unselected score must not be computed")),
-                mock.patch("dreamer.torch.randperm", wraps=torch.randperm) as pair,
-            ):
+            with contextlib.ExitStack() as stack:
+                for metric, method in methods.items():
+                    if metric != agent.ve_metric:
+                        stack.enter_context(
+                            mock.patch.object(
+                                agent, method, side_effect=AssertionError("Unselected score must not be computed")
+                            )
+                        )
+                pair = stack.enter_context(mock.patch("dreamer.torch.randperm", wraps=torch.randperm))
                 _, metrics = agent._cal_grad(data, initial)
             pair.assert_called_once_with(5, device=torch.device("cpu"))
             results.append((metrics, torch.get_rng_state()))
-        for key, value in results[0][0].items():
-            if key != "imag_wasser":
-                torch.testing.assert_close(value, results[1][0][key], rtol=0, atol=0)
-        self.assertNotIn("imag_ucb", results[0][0])
-        self.assertNotIn("imag_wasser", results[1][0])
-        self.assertFalse(results[1][0]["imag_ucb"].requires_grad)
-        torch.testing.assert_close(results[0][1], results[1][1], rtol=0, atol=0)
-        for name, param in wasser._named_params.items():
-            other = ucb._named_params[name]
-            if param.grad is None:
-                self.assertIsNone(other.grad)
-            else:
-                torch.testing.assert_close(param.grad, other.grad, rtol=0, atol=0)
+        for agent, (metrics, rng) in zip((wasser, ucb, sigma), results):
+            for metric in methods:
+                self.assertEqual(f"imag_{metric}" in metrics, metric == agent.ve_metric)
+            self.assertFalse(metrics[f"imag_{agent.ve_metric}"].requires_grad)
+            for key, value in results[0][0].items():
+                if key != "imag_wasser":
+                    torch.testing.assert_close(value, metrics[key], rtol=0, atol=0)
+            torch.testing.assert_close(results[0][1], rng, rtol=0, atol=0)
+            for name, param in wasser._named_params.items():
+                other = agent._named_params[name]
+                if param.grad is None:
+                    self.assertIsNone(other.grad)
+                else:
+                    torch.testing.assert_close(param.grad, other.grad, rtol=0, atol=0)
 
-    def test_ucb_log_uses_all_head_predictions_and_horizon_controls_rollout(self):
-        for metric, horizon in ((m, h) for m in ("wasser", "ucb") for h in (1, 5)):
+    def test_selected_score_uses_all_head_predictions_and_horizon_controls_rollout(self):
+        for metric, horizon in ((m, h) for m in ("wasser", "ucb", "sigma") for h in (1, 5)):
             with self.subTest(metric=metric, horizon=horizon):
                 agent = self.make_agent(metric=metric, imag_horizon=horizon, outscale=0.1)
                 data, initial = self.make_batch(agent)
                 with (
                     mock.patch.object(agent, "_imagine", wraps=agent._imagine) as imagine,
                     mock.patch.object(agent, "_imag_ucb", wraps=agent._imag_ucb) as ucb,
+                    mock.patch.object(agent, "_imag_sigma", wraps=agent._imag_sigma) as sigma,
                 ):
                     _, metrics = agent._cal_grad(data, initial)
                 self.assertEqual(imagine.call_args.args[1], horizon + 1)
-                name = "imag_wasser" if metric == "wasser" else "imag_ucb"
+                name = f"imag_{metric}"
                 self.assertEqual(metrics[name].shape, (horizon, 1))
                 self.assertTrue(torch.isfinite(metrics[name]).all())
                 if metric == "ucb":
@@ -225,9 +271,22 @@ class ValueEnsembleTest(unittest.TestCase):
                     torch.testing.assert_close(metrics[name], expected.mean(dim=0))
                 else:
                     ucb.assert_not_called()
+                if metric == "sigma":
+                    sigma.assert_called_once()
+                    predictions = sigma.call_args.args[0]
+                    self.assertEqual(predictions.shape, (5, 8, horizon + 1, 1))
+                    expected = predictions[:, :, :-1].std(dim=0)
+                    torch.testing.assert_close(metrics[name], expected.mean(dim=0))
+                else:
+                    sigma.assert_not_called()
 
     def test_single_head_bootstrap_and_finite_zero_disagreement(self):
-        agent = self.make_agent(size=1, outscale=0.1)
+        for metric in ("wasser", "sigma"):
+            with self.subTest(metric=metric):
+                self._check_single_head_bootstrap_and_zero_disagreement(metric)
+
+    def _check_single_head_bootstrap_and_zero_disagreement(self, metric):
+        agent = self.make_agent(size=1, outscale=0.1, metric=metric)
         data, initial = self.make_batch(agent)
         predictions = []
         hook = agent._frozen_value[0].register_forward_hook(
@@ -244,9 +303,9 @@ class ValueEnsembleTest(unittest.TestCase):
         imag_args = returns.call_args_list[0].args
         torch.testing.assert_close(imag_args[3], predictions[0])
         torch.testing.assert_close(imag_args[4], predictions[0])
-        torch.testing.assert_close(metrics["imag_wasser"], torch.zeros(3, 1))
-        self.assertEqual(metrics["imag_wasser"].dtype, torch.float32)
-        self.assertFalse(metrics["imag_wasser"].requires_grad)
+        torch.testing.assert_close(metrics[f"imag_{metric}"], torch.zeros(3, 1))
+        self.assertEqual(metrics[f"imag_{metric}"].dtype, torch.float32)
+        self.assertFalse(metrics[f"imag_{metric}"].requires_grad)
         self.assertEqual(metrics["value_ensemble_std"].item(), 0)
         self.assertEqual(metrics["value_ensemble_std_replay"].item(), 0)
         self.assertTrue(all(torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values()))
@@ -390,14 +449,14 @@ class ValueEnsembleTest(unittest.TestCase):
                 self.assert_frozen_sharing(agent)
 
     def test_dynamic_threshold_curve_masks_and_return_normalization(self):
-        for metric in ("wasser", "ucb"):
+        for metric in ("wasser", "ucb", "sigma"):
             with self.subTest(metric=metric):
                 self._check_dynamic_threshold_curve_masks_and_return_normalization(metric)
 
     def _check_dynamic_threshold_curve_masks_and_return_normalization(self, metric):
         agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=1, metric=metric)
-        score_method = "_imag_wasserstein" if metric == "wasser" else "_imag_ucb"
-        metric_name = "imag_wasser" if metric == "wasser" else "imag_ucb"
+        score_method = {"wasser": "_imag_wasserstein", "ucb": "_imag_ucb", "sigma": "_imag_sigma"}[metric]
+        metric_name = f"imag_{metric}"
         agent.dynamic_trunc_quantile = 0.5
         agent.dynamic_trunc_threshold_scale = 2.0
         data, initial = self.make_batch(agent)
@@ -437,10 +496,11 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertFalse(agent.trunc_kappa.value.requires_grad)
 
     def test_dynamic_gradient_boundaries_on_a_partial_prefix(self):
-        for metric, active in [(m, loss) for m in ("wasser", "ucb") for loss in ("policy", "value", "repval")]:
+        cases = [(m, loss) for m in ("wasser", "ucb", "sigma") for loss in ("policy", "value", "repval")]
+        for metric, active in cases:
             with self.subTest(metric=metric, loss=active):
                 agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=1, metric=metric)
-                score_method = "_imag_wasserstein" if metric == "wasser" else "_imag_ucb"
+                score_method = {"wasser": "_imag_wasserstein", "ucb": "_imag_ucb", "sigma": "_imag_sigma"}[metric]
                 agent._loss_scales = {key: float(key == active) for key in agent._loss_scales}
                 data, initial = self.make_batch(agent)
                 scores = torch.tensor([0.0, 2.0, 0.0]).reshape(1, 3, 1).expand(8, -1, -1)

@@ -180,7 +180,7 @@ class OnlineTrainer:
                 if self._should_log(step):
                     for name, value in train_metrics.items():
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-                        if name in ("imag_wasser", "imag_ucb"):
+                        if name in ("imag_wasser", "imag_ucb", "imag_sigma"):
                             self.logger.vector(f"train/{name}", value)
                         else:
                             self.logger.scalar(f"train/{name}", value)
