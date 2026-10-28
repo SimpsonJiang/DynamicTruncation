@@ -62,3 +62,32 @@ def mask_to_last(mask):
     last[:, 0] = 0.0
     last[:, 1:horizon] = (~mask[:, 1:]).float()
     return last
+
+
+@torch.no_grad()
+def truncation_candidates(features, scores, mask, threshold, eligible, origin_step):
+    """Fixed-shape outputs for branching at the *actual* training cutoff.
+
+    features includes the final bootstrap state (H+1); scores/mask contain H
+    outgoing steps. A cutoff at k means restore features[:, k], not k-1 or k+1.
+    The forced prefix in build_truncation_mask remains authoritative. Full-length
+    rollouts and nonfinite scores up to the cutoff are not branch candidates.
+    Filtering/sampling is left outside the compiled training function.
+    """
+    depth = mask.squeeze(-1).long().sum(dim=1)
+    horizon = mask.shape[1]
+    row = torch.arange(mask.shape[0], device=mask.device)
+    score_index = depth.clamp_max(horizon - 1)
+    scalar_scores = scores.squeeze(-1)
+    finite_prefix = torch.isfinite(scalar_scores).int().cumprod(dim=1).bool()[row, score_index]
+    selected_features = features[row, depth].detach()
+    valid = (eligible.reshape(-1).bool() & (depth < horizon) & finite_prefix
+             & torch.isfinite(threshold) & torch.isfinite(selected_features).all(dim=-1))
+    return {
+        "features": selected_features,
+        "depth": depth,
+        "eligible": valid,
+        "origin_step": origin_step.reshape(-1).detach(),
+        "score": scalar_scores[row, score_index].detach(),
+        "threshold": threshold.detach().expand_as(depth),
+    }

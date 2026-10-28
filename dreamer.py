@@ -12,14 +12,16 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
-from dynamic_truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask
+from diagnostics import imagined_entropy_metrics
+from dynamic_truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask, truncation_candidates
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
+from state_decoder import make_state_decoder
 from tools import to_f32
 
 
 class Dreamer(nn.Module):
-    def __init__(self, config, obs_space, act_space):
+    def __init__(self, config, obs_space, act_space, state_spec=None, collect_branch_candidates=False):
         super().__init__()
         self.device = torch.device(config.device)
         self.act_entropy = float(config.act_entropy)  #SAC中熵正则项的系数，0.0003
@@ -162,6 +164,18 @@ class Dreamer(nn.Module):
                 "ema_encoder": self._ema_encoder,
                 "ema_obs_proj": self._ema_obs_proj,
             })
+        self.state_decoder_enabled = bool(config.get("state_decoder", {}).get("enabled", False))
+        self.collect_branch_candidates = bool(collect_branch_candidates)
+        self._pending_branch_candidates = None
+        if self.collect_branch_candidates and not (self.state_decoder_enabled and self.dynamic_trunc_enabled):
+            raise ValueError("Imagined branch candidates require StateDecoder and dynamic truncation")
+        if self.state_decoder_enabled:
+            # The optional probe must not change the base model's initialization/RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.state_decoder = make_state_decoder(
+                    config.state_decoder, self.rssm.feat_size, state_spec
+                )
+            modules["state_decoder"] = self.state_decoder
         # count number of parameters in each module
         for key, module in modules.items(): #打印各个网络的大小
             if isinstance(module, nn.Parameter):
@@ -283,8 +297,8 @@ class Dreamer(nn.Module):
         return self
 
     @torch.no_grad()
-    def act(self, obs, state, eval=False):
-        """Policy inference step."""
+    def act(self, obs, state, eval=False, metrics=None):
+        """Policy inference step, optionally reporting per-state conditional entropy."""
         # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs) # 图像预处理
@@ -300,6 +314,8 @@ class Dreamer(nn.Module):
         # (B, F)
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)
+        if metrics is not None:
+            metrics["action_entropy"] = action_dist.entropy().detach().float()
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample() #在高斯分布中采样, .mode返回均值/mu，所以在推理时的action没有不确定性
         return action, TensorDict(
@@ -349,6 +365,7 @@ class Dreamer(nn.Module):
 
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
+        self._pending_branch_candidates = None
         data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
@@ -358,6 +375,11 @@ class Dreamer(nn.Module):
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
             (stoch, deter), mets = self._cal_grad(p_data, initial)
+        if self.collect_branch_candidates:
+            self._pending_branch_candidates = {
+                key: mets.pop(f"_branch/{key}")
+                for key in ("features", "depth", "eligible", "origin_step", "score", "threshold")
+            }
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
@@ -385,6 +407,12 @@ class Dreamer(nn.Module):
         # update latent vectors in replay buffer
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
+
+    def take_branch_candidates(self):
+        """Consume immediately after update, before the next CUDA graph iteration."""
+        candidates = self._pending_branch_candidates
+        self._pending_branch_candidates = None
+        return candidates
 
     def _cal_grad(self, data, initial):
         """Compute gradients for one batch.
@@ -415,6 +443,11 @@ class Dreamer(nn.Module):
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
+        if self.state_decoder_enabled:
+            losses["state_recon"], state_metrics = self.state_decoder.loss(
+                feat.detach(), data["_physics_state"]
+            )
+            metrics.update(state_metrics)
         if self.rep_loss == "dreamer":
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key])) for key, dist in self.decoder(post_stoch, post_deter).items()
@@ -508,6 +541,7 @@ class Dreamer(nn.Module):
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
         loss_mask = 1.0
+        trunc_mask = None
         if self.dynamic_trunc_enabled:
             raw_threshold = torch.quantile(imag_uncertainty[:, 0].reshape(-1), self.dynamic_trunc_quantile)
             raw_threshold = raw_threshold * self.dynamic_trunc_threshold_scale
@@ -519,6 +553,16 @@ class Dreamer(nn.Module):
             metrics["dynamic_trunc/threshold"] = threshold
             metrics["dynamic_trunc/keep_rate"] = trunc_mask.float().mean()
             metrics["dynamic_trunc/effective_horizon"] = trunc_mask.float().sum(dim=1).mean()
+            if self.collect_branch_candidates:
+                # Only normal replay can seed branches; never recursively branch
+                # from branch replay, nor from an episode-end boundary.
+                eligible = (~(data["is_last"] | data["is_terminal"])).reshape(-1)
+                eligible = eligible & (data["_source"].reshape(-1) == 0)
+                candidates = truncation_candidates(
+                    imag_feat, imag_uncertainty, trunc_mask, threshold,
+                    eligible, data["_origin_step"],
+                )
+                metrics.update({f"_branch/{key}": value for key, value in candidates.items()})
         else:
             last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
@@ -558,6 +602,7 @@ class Dreamer(nn.Module):
         metrics[uncertainty_metric] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
+        metrics.update(imagined_entropy_metrics(entropy, trunc_mask))
         metrics.update(tools.tensorstats(imag_action, "action"))
 
         # === Replay-based value learning (keep gradients through world model) === TODO_JYY，这处很棘手，要考虑rep_value如何分配权重

@@ -24,6 +24,22 @@ buffer:
   device: ${device}
   storage_device: ${device}
 
+branch_collection:
+  mode: "off" # off / replay_state / imagined_state
+  warmup_steps: 20000 # normal environment steps, including action repeat
+  every_steps: 2000 # additional normal environment steps between rounds
+  # imagined_state uses the actual VE cutoff from the latest training update.
+  # Its horizon/metric/minimum prefix come from model.imag_horizon/VE_metric/dynamic_trunc.
+  branches_per_round: 4
+  max_attempts: 16
+  horizon: 64 # policy decisions, excluding the initial reset row
+  replay_capacity: 100000
+  replay_fraction: 0.25 # fraction of training sequences, not loss weight
+  # Both replay devices are inherited from buffer; no independent override.
+  max_velocity: 200.0 # rad/s
+  max_penetration: 0.001 # meters
+  min_angle_norm: 1e-6
+
 trainer:
   steps: ${env.steps}
   pretrain: 0

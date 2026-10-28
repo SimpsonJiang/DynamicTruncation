@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - override /env: dmc_proprio
+
+env:
+  task: dmc_finger_spin
+model:
+  rep_loss: dreamer
+  state_decoder:
+    enabled: false
+branch_collection:
+  mode: replay_state

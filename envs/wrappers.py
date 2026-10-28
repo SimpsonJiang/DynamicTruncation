@@ -28,6 +28,10 @@ class TimeLimit(gym.Wrapper):
         self._step = 0
         return self.env.reset()
 
+    def restore_state(self, *args, **kwargs):
+        self._step = 0
+        return self.env.get_wrapper_attr("restore_state")(*args, **kwargs)
+
 
 class NormalizeActions(gym.Wrapper):
     def __init__(self, env):
@@ -120,9 +124,21 @@ class RewardObs(gym.Wrapper):
 
 
 class Dtype(gym.Wrapper):
+    @staticmethod
+    def _convert_obs(obs):
+        # Exact MuJoCo snapshots must not pass through the float32 conversion.
+        return {k: np.array(v, dtype=np.float64, copy=True) if k == "_integration_state"
+                else tools.convert(v) for k, v in obs.items()}
+
     def step(self, action):
         obs, rew, done, info = self.env.step(action)
-        return tools.convert(obs), np.float32(rew), done, info
+        return self._convert_obs(obs), np.float32(rew), done, info
 
     def reset(self):
-        return tools.convert(self.env.reset())
+        return self._convert_obs(self.env.reset())
+
+    def restore_state(self, *args, **kwargs):
+        return self._convert_obs(self.env.get_wrapper_attr("restore_state")(*args, **kwargs))
+
+    def get_state_spec(self):
+        return self.env.get_wrapper_attr("get_state_spec")()

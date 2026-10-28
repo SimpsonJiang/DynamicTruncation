@@ -104,7 +104,7 @@ class MultiEncoder(nn.Module):
     ):
         super().__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("log_")}
+        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith(("log_", "_"))}
         self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
         self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Encoder CNN shapes:", self.cnn_shapes)
@@ -145,7 +145,7 @@ class MultiDecoder(nn.Module):
     def __init__(self, config, deter, flat_stoch, shapes):
         super().__init__()
         excluded = ("is_first", "is_last", "is_terminal")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded}
+        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("_")}
         self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
         self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Decoder CNN shapes:", self.cnn_shapes)

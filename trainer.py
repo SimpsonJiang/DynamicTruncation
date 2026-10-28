@@ -1,10 +1,11 @@
 import torch
 
 import tools
+from branch_collection import add_source_metadata
 
 
 class OnlineTrainer:
-    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
+    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs, branch_collector=None):
         self.replay_buffer = replay_buffer
         self.logger = logger
         self.train_envs = train_envs
@@ -23,6 +24,8 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        self.branch_collector = branch_collector
+        self.normal_steps = self.branch_steps = self.total_steps = 0
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -108,6 +111,8 @@ class OnlineTrainer:
         envs = self.train_envs
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
+        normal_steps = step
+        branch_steps = discarded_steps = 0
         update_count = 0
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
@@ -117,6 +122,8 @@ class OnlineTrainer:
             envs.env_num, dtype=torch.int32, device=agent.device
         )  # Kept constant so short episodes (< batch_length) remain sampable; RSSM resets via is_first.
         train_metrics = {}
+        real_entropy_sum = torch.zeros((), dtype=torch.float32, device=agent.device)
+        real_entropy_count = torch.zeros((), dtype=torch.int64, device=agent.device)
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
@@ -136,7 +143,9 @@ class OnlineTrainer:
                         self.logger.scalar("episode/length", lengths[i])
                         self.logger.write(step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
-            step += int((~done).sum()) * self._action_repeat  # step is based on env side
+            normal_increment = int((~done).sum()) * self._action_repeat
+            step += normal_increment  # step is based on env side
+            normal_steps += normal_increment
             lengths += ~done
 
             # Step environments.  Each env backend handles device placement
@@ -153,7 +162,13 @@ class OnlineTrainer:
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.
             # (B, A)
-            act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
+            collection_metrics = {}
+            act, agent_state = agent.act(trans.clone(), agent_state, eval=False, metrics=collection_metrics)
+            if "action_entropy" in collection_metrics:
+                # Terminal observations have no outgoing training action. Reset
+                # observations do, and are included. Branch/eval calls are separate.
+                real_entropy_sum += torch.where(~done, collection_metrics["action_entropy"], 0.0).sum()
+                real_entropy_count += (~done).sum()
 
             # Store transition.
             # We keep the observation and the action that produced it together.
@@ -162,29 +177,65 @@ class OnlineTrainer:
             trans["stoch"] = agent_state["stoch"]
             trans["deter"] = agent_state["deter"]
             trans["episode"] = episode_ids  # Don't lift dim
+            if self.branch_collector is not None:
+                add_source_metadata(trans, 0, -1, normal_steps, 0)
             if "image" in trans:
                 video_cache.append(trans["image"][0])
             self.replay_buffer.add_transition(trans.detach())
             returns += trans["reward"][:, 0]
+            if (self.branch_collector is not None and update_count > 0
+                    and self.replay_buffer.can_sample() and self.branch_collector.due(normal_steps)
+                    and self.steps - step >= self._action_repeat):
+                used, branch_metrics = self.branch_collector.collect(
+                    agent, self.replay_buffer.normal, self.replay_buffer.branch,
+                    normal_steps, self.steps - step,
+                )
+                step += used
+                branch_steps += used
+                discarded_steps += branch_metrics["branch/discarded_steps"]
+                for name, value in branch_metrics.items():
+                    self.logger.scalar(name, value)
+                self.logger.scalar("collection/normal_steps", normal_steps)
+                self.logger.scalar("collection/branch_steps", branch_steps)
+                self.logger.scalar("collection/discarded_branch_steps", discarded_steps)
+                self.logger.scalar("collection/total_steps", step)
+                self.logger.write(step)
+            self.normal_steps, self.branch_steps, self.total_steps = normal_steps, branch_steps, step
             # Update models after enough data has accumulated
-            if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
+            ready = (self.replay_buffer.can_sample() if self.branch_collector is not None
+                     else step // (envs.env_num * self._action_repeat) > self.batch_length + 1)
+            if ready:
                 if self._should_pretrain():
                     update_num = self.pretrain
                 else:
                     update_num = self._updates_needed(step)
                 for _ in range(update_num):
                     _metrics = agent.update(self.replay_buffer)
+                    if self.branch_collector is not None and self.branch_collector.config.mode == "imagined_state":
+                        # Copy selected graph outputs before another update/act can
+                        # reuse the CUDA graph buffers that contain these features.
+                        self.branch_collector.offer_candidates(agent.take_branch_candidates())
                     train_metrics = _metrics
                 update_count += update_num
                 # Log training metrics
                 if self._should_log(step):
                     for name, value in train_metrics.items():
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-                        if name in ("imag_wasser", "imag_ucb"):
+                        if name in ("imag_wasser", "imag_ucb", "imag_action_entropy"):
                             self.logger.vector(f"train/{name}", value)
                         else:
                             self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
+                    self.logger.scalar(
+                        "train/action_entropy_real", real_entropy_sum / real_entropy_count.clamp_min(1)
+                    )
+                    real_entropy_sum.zero_()
+                    real_entropy_count.zero_()
+                    if self.branch_collector is not None:
+                        self.logger.scalar("train/branch_fraction", self.replay_buffer.last_branch_fraction)
+                        self.logger.scalar("collection/normal_steps", normal_steps)
+                        self.logger.scalar("collection/branch_steps", branch_steps)
+                        self.logger.scalar("collection/total_steps", step)
                     if self.video_pred_log:
                         data, _, initial = self.replay_buffer.sample()
                         self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))

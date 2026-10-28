@@ -8,6 +8,20 @@ log_grads: False
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 
+state_decoder:
+  enabled: false
+  shape: null # inferred from the task's StateDecoder subclass
+  layers: 2
+  units: ${model.units}
+  act: ${model.act}
+  norm: ${model.norm}
+  dist:
+    name: 'identity'
+  outscale: 1.0
+  device: ${device}
+  symlog_inputs: False
+  name: 'state_decoder'
+
 lr: 4e-5
 agc: 0.3
 pmin: 1e-3
@@ -29,6 +43,7 @@ dynamic_trunc:
   min_horizon: 8
 
 loss_scales:
+  state_recon: 1.0
   barlow: 0.05
   infonce: 1.0
   recon: 1.0

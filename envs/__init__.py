@@ -3,18 +3,21 @@ import atexit
 from . import parallel, wrappers
 
 
-def make_envs(config):
+def make_envs(config, capture_state=False, capture_snapshot=False):
     suite = config.task.split("_", 1)[0]
 
     if suite == "isaaclab":
         return _make_isaaclab_envs(config)
 
     def env_constructor(idx):
+        return lambda: make_env(config, idx, capture_state, capture_snapshot)
+
+    def eval_constructor(idx):
         return lambda: make_env(config, idx)
 
     train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
     eval_envs = (
-        parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
+        parallel.ParallelEnv(eval_constructor, config.eval_episode_num, config.device)
         if config.eval_episode_num > 0
         else None
     )
@@ -52,12 +55,13 @@ def _make_isaaclab_envs(config):
     return train_envs, eval_envs, obs_space, act_space
 
 
-def make_env(config, id):
+def make_env(config, id, capture_state=False, capture_snapshot=False):
     suite, task = config.task.split("_", 1)
     if suite == "dmc":
         import envs.dmc as dmc
 
-        env = dmc.DeepMindControl(task, config.action_repeat, config.size, seed=config.seed + id)
+        env = dmc.DeepMindControl(task, config.action_repeat, config.size, seed=config.seed + id,
+                                 capture_state=capture_state, capture_snapshot=capture_snapshot)
         env = wrappers.NormalizeActions(env)
     elif suite == "atari":
         import envs.atari as atari

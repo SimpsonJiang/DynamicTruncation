@@ -72,7 +72,9 @@ class ParallelEnv:
 
         # Keep data on CPU; caller will .to(device, non_blocking=True) after pinning.
         # TensorDict batch size is (B,).
-        td = TensorDict({**obs_tensors, "reward": rew_stacked}, batch_size=(self.env_num,), device="cpu").pin_memory()
+        td = TensorDict({**obs_tensors, "reward": rew_stacked}, batch_size=(self.env_num,), device="cpu")
+        if torch.device(self.device).type == "cuda":
+            td = td.pin_memory()
         done = torch.as_tensor(new_d, device="cpu")
         return self.lift_dim(td), done
 

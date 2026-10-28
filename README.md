@@ -21,9 +21,43 @@ python3 train.py logdir=./logdir/test
 ```
 
 Monitoring results:
+
 ```bash
 tensorboard --logdir ./logdir
 ```
+
+Record evaluation videos from a completed training run:
+
+```bash
+python3 eval_video.py \
+    --logdir logdir/VE_wasser_H32/dmc_finger_spin_proprio_s100_1026 \
+    --seconds 30 \
+    --num-videos 3 \
+    --device cuda:0
+```
+
+The script restores `latest.pt` with the run's `.hydra/config.yaml` and uses
+evaluation actions (`agent.act(..., eval=True)`). By default, it generates three
+30-second MP4 files in `<logdir>/eval_videos/`. `--seconds` sets the duration of
+each video; `--num-videos` sets the number generated per invocation. Videos have
+unique names, so repeated invocations keep previous recordings. If an episode
+ends before the requested duration, recording continues with a new episode and
+fresh policy memory. Duration is rounded up to the next video frame.
+Each frame displays `rew` (the current decision's reward, including action repeat)
+and `ret` (the undiscounted episode return including that reward) in the top-left
+corner. `ret` resets when a new episode starts. Both values use three decimal places.
+
+For DMC, FPS defaults to the control rate divided by action repeat, and video
+resolution defaults to 512×512 without changing the policy's observation size.
+Use `--width 640 --height 480` to change DMC recording resolution, or `--fps 30`
+to override playback FPS (one environment decision is recorded per frame, so
+overriding FPS also changes playback speed). Other CPU environment suites use
+their native observation images at 30 FPS by default. IsaacLab is not supported
+by this script. Use `--device cpu` for CPU inference, `--seed` to set the
+evaluation seed (default: training seed + 10000), `--output-dir` to change the
+destination, or `--checkpoint` / `--config` to select another checkpoint/config.
+A JSON file alongside the videos records durations and episode returns; a final
+unfinished episode is recorded separately. Long videos stream directly to disk.
 
 Switching algorithms:
 
@@ -84,6 +118,23 @@ starts, excluding the final bootstrap state. TensorBoard records each depth as
 `train/imag_wasser/step_00` or `train/imag_ucb/step_00`, `step_01`, etc.
 The scalar `train/dynamic_trunc/effective_horizon` reports the mean retained length.
 
+Policy entropy diagnostics are logged without changing the actor objective:
+
+- `train/action_entropy` retains its existing mean over all imagined positions.
+- `train/action_entropy_valid` averages only positions retained by truncation,
+  without discount/continuation weighting. It equals the full mean when
+  truncation is disabled, and is zero for an empty mask.
+- `train/imag_action_entropy` is an `[H, 1]` array of means over imagination
+  starts, excluding the bootstrap state. TensorBoard records `step_00`, etc.
+- `train/action_entropy_real` averages conditional policy entropy at normal
+  training-environment decision states since the previous training log. Reset
+  states are included; terminal observations, evaluation, and branch rollouts
+  are excluded. This is the distribution's entropy, not the standard deviation
+  of actions pooled across states.
+
+For continuous actions these entropies sum over action dimensions and use nats.
+The diagnostics do not add samples or change the random-number stream.
+
 In `run.sh`, `VE_metric` and `imag_hori` are forwarded to each worker as
 `model.VE_metric` and `model.imag_horizon`. `beta` is read from the model config
 (`configs/model/_base_.yaml`), rather than overridden by the launch script. The existing
@@ -96,20 +147,20 @@ its assigned queue sequentially; the tmux session is deleted after all workers e
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
-
 ## Available Benchmarks
+
 At the moment, the following benchmarks are available in this repository.
 
-| Environment        | Observation | Action | Budget | Description |
-|-------------------|---|---|---|-----------------------|
-| [Meta-World](https://github.com/Farama-Foundation/Metaworld) | Image | Continuous | 1M | Robotic manipulation with complex contact interactions.|
-| [DMC Proprio](https://github.com/deepmind/dm_control) | State | Continuous | 500K | DeepMind Control Suite with low-dimensional inputs. |
-| [DMC Vision](https://github.com/deepmind/dm_control) | Image | Continuous |1M| DeepMind Control Suite with high-dimensional images inputs. |
-| [DMC Subtle](envs/dmc_subtle.py) | Image | Continuous |1M| DeepMind Control Suite with tiny task-relevant objects. |
-| [Atari 100k](https://github.com/Farama-Foundation/Arcade-Learning-Environment) | Image | Discrete |400K| 26 Atari games. |
-| [Crafter](https://github.com/danijar/crafter) | Image | Discrete |1M| Survival environment to evaluates diverse agent abilities.|
-| [Memory Maze](https://github.com/jurgisp/memory-maze) | Image |Discrete |100M| 3D mazes to evaluate RL agents' long-term memory.|
-| [IsaacLab](https://github.com/isaac-sim/IsaacLab) | State / Image | Continuous | 0.5M–1M | GPU-parallelized robotic simulation. |
+| Environment                                                                   | Observation   | Action     | Budget   | Description                                                 |
+| ----------------------------------------------------------------------------- | ------------- | ---------- | -------- | ----------------------------------------------------------- |
+| [Meta-World](https://github.com/Farama-Foundation/Metaworld)                   | Image         | Continuous | 1M       | Robotic manipulation with complex contact interactions.     |
+| [DMC Proprio](https://github.com/deepmind/dm_control)                          | State         | Continuous | 500K     | DeepMind Control Suite with low-dimensional inputs.         |
+| [DMC Vision](https://github.com/deepmind/dm_control)                           | Image         | Continuous | 1M       | DeepMind Control Suite with high-dimensional images inputs. |
+| [DMC Subtle](envs/dmc_subtle.py)                                               | Image         | Continuous | 1M       | DeepMind Control Suite with tiny task-relevant objects.     |
+| [Atari 100k](https://github.com/Farama-Foundation/Arcade-Learning-Environment) | Image         | Discrete   | 400K     | 26 Atari games.                                             |
+| [Crafter](https://github.com/danijar/crafter)                                  | Image         | Discrete   | 1M       | Survival environment to evaluates diverse agent abilities.  |
+| [Memory Maze](https://github.com/jurgisp/memory-maze)                          | Image         | Discrete   | 100M     | 3D mazes to evaluate RL agents' long-term memory.           |
+| [IsaacLab](https://github.com/isaac-sim/IsaacLab)                              | State / Image | Continuous | 0.5M–1M | GPU-parallelized robotic simulation.                        |
 
 Use Hydra to select a benchmark and a specific task using `env` and `env.task`, respectively.
 
