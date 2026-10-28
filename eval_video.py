@@ -5,12 +5,14 @@ import json
 import math
 import os
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import torch
 from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 from omegaconf import OmegaConf
+from PIL import Image, ImageDraw, ImageFont
 
 import tools
 from dreamer import Dreamer
@@ -81,6 +83,32 @@ def video_frame(env, obs, suite, width, height):
     return np.pad(frame, ((0, frame.shape[0] % 2), (0, frame.shape[1] % 2), (0, 0)), mode="edge")
 
 
+@lru_cache(maxsize=16)
+def overlay_font(size):
+    try:
+        return ImageFont.truetype("DejaVuSansMono.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def overlay_rewards(frame, reward, episode_return):
+    """Annotate the rendered frame only; policy observations remain untouched."""
+    image = Image.fromarray(frame)
+    draw = ImageDraw.Draw(image, "RGBA")
+    padding = max(2, min(image.size) // 64)
+    font_size = max(8, min(24, min(image.size) // 22))
+    text = f"rew: {float(reward):.3f}\nret: {episode_return:.3f}"
+    font = overlay_font(font_size)
+    bounds = draw.multiline_textbbox((padding, padding), text, font=font, spacing=2)
+    while bounds[2] + padding > image.width and font_size > 6:
+        font_size -= 1
+        font = overlay_font(font_size)
+        bounds = draw.multiline_textbbox((padding, padding), text, font=font, spacing=2)
+    draw.rectangle((0, 0, bounds[2] + padding, bounds[3] + padding), fill=(0, 0, 0, 180))
+    draw.multiline_text((padding, padding), text, font=font, spacing=2, fill=(255, 255, 255, 255))
+    return np.asarray(image)
+
+
 @torch.no_grad()
 def record_video(agent, env, path, seconds, fps, suite, width, height):
     frame_count = max(1, math.ceil(seconds * fps))
@@ -106,7 +134,8 @@ def record_video(agent, env, path, seconds, fps, suite, width, height):
                 obs, reward, done, _ = env.step(action[0].cpu().numpy())
                 episode_return += float(reward)
                 episode_steps += 1
-                writer.write_frame(video_frame(env, obs, suite, width, height))
+                frame = video_frame(env, obs, suite, width, height)
+                writer.write_frame(overlay_rewards(frame, reward, episode_return))
                 if done:
                     completed_episodes.append({"return": episode_return, "steps": episode_steps})
                     episode_return, episode_steps = 0.0, 0
@@ -197,6 +226,10 @@ def main():
             "task": config.env.task,
             "seed": seed,
             "requested_seconds": args.seconds,
+            "overlay": {
+                "rew": "current decision reward (including action repeat)",
+                "ret": "undiscounted episode return including the current reward",
+            },
             "videos": results,
         }
         (output_dir / f"eval_{timestamp}.json").write_text(json.dumps(metadata, indent=2) + "\n")
