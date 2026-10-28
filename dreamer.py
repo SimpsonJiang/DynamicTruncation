@@ -38,8 +38,8 @@ class Dreamer(nn.Module):
         ):
             raise ValueError("model.value_ensemble_size must be a positive integer")
         self.ve_metric = str(config.get("VE_metric", "wasser"))
-        if self.ve_metric not in ("wasser", "ucb"):
-            raise ValueError("model.VE_metric must be 'wasser' or 'ucb'")
+        if self.ve_metric not in ("wasser", "ucb", "sigma"):
+            raise ValueError("model.VE_metric must be 'wasser', 'ucb' or 'sigma'")
         self.ucb_beta = float(config.get("beta", 0.1))
         if not math.isfinite(self.ucb_beta) or self.ucb_beta < 0:
             raise ValueError("model.beta must be finite and non-negative")
@@ -502,8 +502,10 @@ class Dreamer(nn.Module):
         # (B*T, H, 1): each trajectory gates on its own current-state score.
         if self.ve_metric == "wasser":
             imag_uncertainty = self._imag_wasserstein(imag_value_dist)
-        else:
+        elif self.ve_metric == "ucb":
             imag_uncertainty = self._imag_ucb(imag_values)
+        else:
+            imag_uncertainty = self._imag_sigma(imag_values)
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
@@ -554,7 +556,7 @@ class Dreamer(nn.Module):
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_values)
         metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
-        uncertainty_metric = "imag_wasser" if self.ve_metric == "wasser" else "imag_ucb"
+        uncertainty_metric = f"imag_{self.ve_metric}"
         metrics[uncertainty_metric] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
@@ -619,6 +621,15 @@ class Dreamer(nn.Module):
             return values[0]
         std, mean = torch.std_mean(values, dim=0, unbiased=True)
         return mean + self.ucb_beta * std
+
+    def _imag_sigma(self, imag_values):
+            """sample std over all heads, excluding the bootstrap state."""
+            # (heads, B*T, H, 1), using scalar predictions in raw return units.
+            values = to_f32(imag_values.detach()[:, :, :-1])
+            if values.shape[0] == 1:
+                return values[0]
+            std = torch.std(values, dim=0, unbiased=True)
+            return std
 
     @torch.no_grad()
     def _imag_wasserstein(self, value_dists):
