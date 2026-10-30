@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from dreamer import Dreamer
-from dynamic_truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask
+from truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask
 
 
 class DynamicTruncationTest(unittest.TestCase):

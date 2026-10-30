@@ -12,10 +12,10 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
-from dynamic_truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
+from truncation import ThresholdEMA, build_truncation_mask, cal_ens_uncertainty, mask_to_last, normalized_mask
 
 
 class Dreamer(nn.Module):
@@ -37,9 +37,9 @@ class Dreamer(nn.Module):
             or self.value_ensemble_size < 1
         ):
             raise ValueError("model.value_ensemble_size must be a positive integer")
-        self.ve_metric = str(config.get("VE_metric", "wasser"))
-        if self.ve_metric not in ("wasser", "ucb", "sigma", "cramer", "sqrt_cramer"):
-            raise ValueError("model.VE_metric must be 'wasser', 'ucb', 'sigma', 'cramer' or 'sqrt_cramer'")
+        self.uncer_metric = str(config.get("uncer_metric", "wasser"))
+        if self.uncer_metric not in ("wasser", "ucb", "sigma", "cramer", "sqrt_cramer"):
+            raise ValueError("model.uncer_metric must be 'wasser', 'ucb', 'sigma', 'cramer' or 'sqrt_cramer'")
         self.ucb_beta = float(config.get("beta", 0.1))
         if not math.isfinite(self.ucb_beta) or self.ucb_beta < 0:
             raise ValueError("model.beta must be finite and non-negative")
@@ -500,14 +500,7 @@ class Dreamer(nn.Module):
             imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
         imag_value_dist = [head(imag_feat) for head in self.value]
         # (B*T, H, 1): each trajectory gates on its own current-state score.
-        if self.ve_metric == "wasser":
-            imag_uncertainty = self._imag_wasserstein(imag_value_dist)
-        elif self.ve_metric in ("cramer", "sqrt_cramer"):
-            imag_uncertainty = self._imag_cramer(imag_value_dist, take_sqrt=self.ve_metric == "sqrt_cramer")
-        elif self.ve_metric == "ucb":
-            imag_uncertainty = self._imag_ucb(imag_values)
-        else:
-            imag_uncertainty = self._imag_sigma(imag_values)
+        imag_uncertainty = cal_ens_uncertainty(imag_value_dist, imag_values, self.uncer_metric, beta=self.ucb_beta)
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
@@ -558,7 +551,7 @@ class Dreamer(nn.Module):
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_values)
         metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
-        uncertainty_metric = f"imag_{self.ve_metric}"
+        uncertainty_metric = f"imag_{self.uncer_metric}"
         metrics[uncertainty_metric] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
@@ -613,58 +606,6 @@ class Dreamer(nn.Module):
             nll = -dist.log_prob(target) - dist.log_prob(slow_values[i].detach())
             losses.append(torch.mean(weight * nll[:, :-1].unsqueeze(-1)))
         return torch.stack(losses).mean()
-
-    @torch.no_grad()
-    def _imag_ucb(self, imag_values):
-        """Mean + beta * sample std over all heads, excluding the bootstrap state."""
-        # (heads, B*T, H, 1), using scalar predictions in raw return units.
-        values = to_f32(imag_values.detach()[:, :, :-1])
-        if values.shape[0] == 1:
-            return values[0]
-        std, mean = torch.std_mean(values, dim=0, unbiased=True)
-        return mean + self.ucb_beta * std
-
-    @torch.no_grad()
-    def _imag_sigma(self, imag_values):
-        """Sample std over all heads, excluding the bootstrap state."""
-        # (heads, B*T, H, 1), using scalar predictions in raw return units.
-        values = to_f32(imag_values.detach()[:, :, :-1])
-        if values.shape[0] == 1:
-            return torch.zeros_like(values[0])
-        return torch.std(values, dim=0, unbiased=True)
-
-    @torch.no_grad()
-    def _imag_wasserstein(self, value_dists):
-        """Per-state mean pairwise W1, shape (B*T, H, 1), excluding the final bootstrap state."""
-        if len(value_dists) == 1:
-            # A single member has no pairwise disagreement.
-            return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
-        # Each CDF has shape (B*T, T_imag-1, num_bins-1); all heads share the same bins.
-        cdfs = [to_f32(dist.probs.detach()[:, :-1]).cumsum(dim=-1)[..., :-1] for dist in value_dists]
-        widths = to_f32(value_dists[0].bins.detach()).diff()
-        total = torch.zeros_like(cdfs[0][..., :1])
-        for i in range(len(cdfs)):
-            for j in range(i + 1, len(cdfs)):
-                # Reduce each pair immediately instead of materializing all pairwise distances.
-                total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1, keepdim=True)
-        return total / (len(cdfs) * (len(cdfs) - 1) // 2)
-
-    @torch.no_grad()
-    def _imag_cramer(self, value_dists, take_sqrt=False):
-        """Mean pairwise squared Cramer score, optionally rooted before averaging."""
-        if len(value_dists) == 1:
-            return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
-        # Cache full-distribution CDFs once per head, excluding the bootstrap state.
-        cdfs = [to_f32(dist.probs.detach()[:, :-1]).cumsum(dim=-1)[..., :-1] for dist in value_dists]
-        widths = to_f32(value_dists[0].bins.detach()).diff()
-        total = torch.zeros_like(cdfs[0][..., :1])
-        for i in range(len(cdfs)):
-            for j in range(i + 1, len(cdfs)):
-                distance = ((cdfs[i] - cdfs[j]).square() * widths).sum(dim=-1, keepdim=True)
-                if take_sqrt:
-                    distance = distance.clamp_min(0.0).sqrt()
-                total = total + distance
-        return total / (len(cdfs) * (len(cdfs) - 1) // 2)
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon): #TODO_JYY

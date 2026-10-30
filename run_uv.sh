@@ -10,10 +10,10 @@ PROCS_PER_GPU=2 # Maximum concurrent training jobs on each GPU.
 
 enable_dny_trunc=true
 val_ens_num=5
-VE_metric=wasser
+uncer_metric=wasser
 # wasser / ucb / sigma / cramer / sqrt_cramer
 imag_hori=32
-METHOD=VE_${VE_metric}_H${imag_hori} # Value Ensemble
+METHOD=VE_${uncer_metric}_H${imag_hori} # Value Ensemble
 
 GPU_IDs=(
     4
@@ -85,7 +85,7 @@ train_job() {
             model.rep_loss=dreamer \
             "model.dynamic_trunc.enabled=${enable_dny_trunc}" \
             "model.value_ensemble_size=${val_ens_num}" \
-            "model.VE_metric=${VE_metric}" \
+            "model.uncer_metric=${uncer_metric}" \
             "model.imag_horizon=${imag_hori}" \
             "seed=$seed"; then
         printf '[GPU %s] Finished task=%s seed=%s\n' "$GPU_ID" "$task" "$seed"
@@ -133,8 +133,8 @@ for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
             "$gpu" "$PYTHON" "$MODAL" "$METHOD" "$DATE"
         printf 'enable_dny_trunc=%q\nval_ens_num=%q\n' \
             "$enable_dny_trunc" "$val_ens_num"
-        printf 'VE_metric=%q\nimag_hori=%q\n' \
-            "$VE_metric" "$imag_hori"
+        printf 'uncer_metric=%q\nimag_hori=%q\n' \
+            "$uncer_metric" "$imag_hori"
         declare -f train_job
     } > "$worker"
 

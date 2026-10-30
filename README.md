@@ -44,7 +44,7 @@ advantage baseline. All heads train on the same return targets, with a separate 
 target per head; their losses are averaged before backpropagation.
 
 Dynamic imagination truncation is enabled by default. Each trajectory uses its
-current-state score selected by `model.VE_metric` (`wasser` by default), a
+current-state score selected by `model.uncer_metric` (`wasser` by default), a
 lagged EMA of the first-step 95th percentile (decay 0.999), and a minimum of 8 steps.
 Returns bootstrap at the truncation boundary; actor and imagined value losses use
 the retained prefix. To use the full imagination horizon:
@@ -70,8 +70,8 @@ detached float32, and use the existing threshold EMA and prefix masks.
 No epsilon or extra normalization is added; identical distributions give zero.
 
 ```bash
-python3 train.py model.rep_loss=dreamer model.VE_metric=cramer
-python3 train.py model.rep_loss=dreamer model.VE_metric=sqrt_cramer
+python3 train.py model.rep_loss=dreamer model.uncer_metric=cramer
+python3 train.py model.rep_loss=dreamer model.uncer_metric=sqrt_cramer
 ```
 
 `ucb` uses all heads' scalar value predictions and the sample standard deviation:
@@ -89,7 +89,7 @@ The score is detached float32 and receives no extra normalization or clipping.
 It includes the predicted value mean, so identical heads can have nonzero UCB.
 
 ```bash
-python3 train.py model.rep_loss=dreamer model.VE_metric=ucb model.imag_horizon=30
+python3 train.py model.rep_loss=dreamer model.uncer_metric=ucb model.imag_horizon=30
 ```
 
 For a single-head baseline, set `model.dynamic_trunc.enabled=false` and
@@ -98,7 +98,7 @@ and advantage. W1, sigma, cramer, and sqrt_cramer are zero; UCB equals the
 single prediction (its standard deviation is defined as zero).
 Dynamic truncation requires at least two heads.
 
-`model.VE_metric=sigma` uses only the sample standard deviation of the heads'
+`model.uncer_metric=sigma` uses only the sample standard deviation of the heads'
 scalar values, in raw return units. It uses the same truncation mechanism;
 `model.beta` does not affect sigma.
 
@@ -110,11 +110,18 @@ each depth under the selected metric as `step_00`, `step_01`, etc.
 Cramer scores are independent of `model.beta`, which is used only by UCB.
 The scalar `train/dynamic_trunc/effective_horizon` reports the mean retained length.
 
-In `run.sh`, `VE_metric` and `imag_hori` are forwarded to each worker as
-`model.VE_metric` and `model.imag_horizon`. `beta` is read from the model config
+In `run.sh`, `uncer_metric` and `imag_hori` are forwarded to each worker as
+`model.uncer_metric` and `model.imag_horizon`. `beta` is read from the model config
 (`configs/model/_base_.yaml`), rather than overridden by the launch script. The existing
 `enable_dny_trunc` and `val_ens_num` settings continue to control truncation and
 head count.
+
+Ensemble uncertainty calculations and metric selection live in `truncation.py`.
+The entry point is `cal_ens_uncertainty(imag_value_dist, imag_value, metric, *, beta=0.1)`.
+Here `imag_value` contains all heads with shape `[K, B*T, H+1, 1]`, rather than
+the two-head bootstrap mean. The result is detached float32 `[B*T, H, 1]`.
+Use `model.uncer_metric` for Hydra overrides and `uncer_metric` in the launch
+scripts; the metric values and existing log names are unchanged.
 
 `PROCS_PER_GPU` in `run.sh` defaults to `1` and limits concurrent training jobs
 on each GPU. Set it to `2` to run up to two jobs per GPU. Each worker processes
