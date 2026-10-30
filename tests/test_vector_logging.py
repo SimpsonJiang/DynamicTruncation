@@ -18,7 +18,7 @@ from trainer import OnlineTrainer
 
 class VectorLoggingTest(unittest.TestCase):
     def test_json_keeps_shape_and_tensorboard_records_steps_without_stale_vectors(self):
-        for metric in ("imag_wasser", "imag_ucb", "imag_sigma"):
+        for metric in ("imag_wasser", "imag_ucb", "imag_sigma", "imag_cramer", "imag_sqrt_cramer"):
             with self.subTest(metric=metric):
                 self._check_json_and_tensorboard(metric)
 
@@ -51,7 +51,7 @@ class VectorLoggingTest(unittest.TestCase):
             self.assertEqual([(e.step, e.value) for e in second], [(5, 2.0)])
 
     def test_trainer_routes_selected_uncertainty_to_vector_logger(self):
-        for metric in ("imag_wasser", "imag_ucb", "imag_sigma"):
+        for metric in ("imag_wasser", "imag_ucb", "imag_sigma", "imag_cramer", "imag_sqrt_cramer"):
             with self.subTest(metric=metric):
                 self._check_trainer_routing(metric)
 

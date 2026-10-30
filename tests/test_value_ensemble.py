@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import math
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,15 @@ from tensordict import TensorDict
 from distributions import TwoHot
 from dreamer import Dreamer
 from networks import MLPHead
+
+
+SCORE_METHODS = {
+    "wasser": "_imag_wasserstein",
+    "ucb": "_imag_ucb",
+    "sigma": "_imag_sigma",
+    "cramer": "_imag_cramer",
+    "sqrt_cramer": "_imag_cramer",
+}
 
 
 class ValueEnsembleTest(unittest.TestCase):
@@ -124,7 +134,7 @@ class ValueEnsembleTest(unittest.TestCase):
                 self.make_agent(size=size)
 
     def test_single_head_requires_disabled_truncation(self):
-        for metric in ("wasser", "ucb", "sigma"):
+        for metric in SCORE_METHODS:
             with (
                 self.subTest(metric=metric),
                 self.assertRaisesRegex(ValueError, "Dynamic truncation requires at least 2"),
@@ -211,30 +221,28 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertIsNone(values.grad)
 
     def test_metric_switch_without_truncation_preserves_losses_gradients_and_rng(self):
-        wasser = self.make_agent(outscale=0.1)
-        ucb = self.make_agent(outscale=0.1, metric="ucb", beta=2)
-        sigma = self.make_agent(outscale=0.1, metric="sigma")
-        ucb.load_state_dict(wasser.state_dict(), strict=True)
-        sigma.load_state_dict(wasser.state_dict(), strict=True)
+        agents = [self.make_agent(outscale=0.1, metric=metric, beta=2) for metric in SCORE_METHODS]
+        wasser = agents[0]
+        for agent in agents[1:]:
+            agent.load_state_dict(wasser.state_dict(), strict=True)
         data, initial = self.make_batch(wasser)
         results = []
-        methods = {"wasser": "_imag_wasserstein", "ucb": "_imag_ucb", "sigma": "_imag_sigma"}
-        for agent in (wasser, ucb, sigma):
+        for agent in agents:
             torch.manual_seed(43)
             with contextlib.ExitStack() as stack:
-                for metric, method in methods.items():
-                    if metric != agent.ve_metric:
-                        stack.enter_context(
-                            mock.patch.object(
-                                agent, method, side_effect=AssertionError("Unselected score must not be computed")
-                            )
+                unused = set(SCORE_METHODS.values()) - {SCORE_METHODS[agent.ve_metric]}
+                for method in sorted(unused):
+                    stack.enter_context(
+                        mock.patch.object(
+                            agent, method, side_effect=AssertionError("Unselected score must not be computed")
                         )
+                    )
                 pair = stack.enter_context(mock.patch("dreamer.torch.randperm", wraps=torch.randperm))
                 _, metrics = agent._cal_grad(data, initial)
             pair.assert_called_once_with(5, device=torch.device("cpu"))
             results.append((metrics, torch.get_rng_state()))
-        for agent, (metrics, rng) in zip((wasser, ucb, sigma), results):
-            for metric in methods:
+        for agent, (metrics, rng) in zip(agents, results):
+            for metric in SCORE_METHODS:
                 self.assertEqual(f"imag_{metric}" in metrics, metric == agent.ve_metric)
             self.assertFalse(metrics[f"imag_{agent.ve_metric}"].requires_grad)
             for key, value in results[0][0].items():
@@ -249,7 +257,7 @@ class ValueEnsembleTest(unittest.TestCase):
                     torch.testing.assert_close(param.grad, other.grad, rtol=0, atol=0)
 
     def test_selected_score_uses_all_head_predictions_and_horizon_controls_rollout(self):
-        for metric, horizon in ((m, h) for m in ("wasser", "ucb", "sigma") for h in (1, 5)):
+        for metric, horizon in ((m, h) for m in SCORE_METHODS for h in (1, 5)):
             with self.subTest(metric=metric, horizon=horizon):
                 agent = self.make_agent(metric=metric, imag_horizon=horizon, outscale=0.1)
                 data, initial = self.make_batch(agent)
@@ -257,6 +265,7 @@ class ValueEnsembleTest(unittest.TestCase):
                     mock.patch.object(agent, "_imagine", wraps=agent._imagine) as imagine,
                     mock.patch.object(agent, "_imag_ucb", wraps=agent._imag_ucb) as ucb,
                     mock.patch.object(agent, "_imag_sigma", wraps=agent._imag_sigma) as sigma,
+                    mock.patch.object(agent, "_imag_cramer", wraps=agent._imag_cramer) as cramer,
                 ):
                     _, metrics = agent._cal_grad(data, initial)
                 self.assertEqual(imagine.call_args.args[1], horizon + 1)
@@ -279,9 +288,19 @@ class ValueEnsembleTest(unittest.TestCase):
                     torch.testing.assert_close(metrics[name], expected.mean(dim=0))
                 else:
                     sigma.assert_not_called()
+                if metric in ("cramer", "sqrt_cramer"):
+                    cramer.assert_called_once()
+                    self.assertEqual(cramer.call_args.kwargs, {"take_sqrt": metric == "sqrt_cramer"})
+                    dists = cramer.call_args.args[0]
+                    self.assertEqual(len(dists), 5)
+                    self.assertEqual(dists[0].probs.shape[:2], (8, horizon + 1))
+                    expected = agent._imag_cramer(dists, take_sqrt=metric == "sqrt_cramer")
+                    torch.testing.assert_close(metrics[name], expected.mean(dim=0))
+                else:
+                    cramer.assert_not_called()
 
     def test_single_head_bootstrap_and_finite_zero_disagreement(self):
-        for metric in ("wasser", "sigma"):
+        for metric in ("wasser", "sigma", "cramer", "sqrt_cramer"):
             with self.subTest(metric=metric):
                 self._check_single_head_bootstrap_and_zero_disagreement(metric)
 
@@ -430,6 +449,89 @@ class ValueEnsembleTest(unittest.TestCase):
             else:
                 torch.testing.assert_close(param.grad, grads[name], rtol=0, atol=0)
 
+    def test_cramer_identical_single_head_and_point_masses(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-3.0, -1.0, 4.0])
+        left = TwoHot(torch.tensor([1.0, 0.0, 0.0]).log().expand(2, 4, -1), bins)
+        right = TwoHot(torch.tensor([0.0, 0.0, 1.0]).log().expand(2, 4, -1), bins)
+        for take_sqrt in (False, True):
+            with self.subTest(take_sqrt=take_sqrt):
+                for dists in ([left], [left] * 5):
+                    torch.testing.assert_close(agent._imag_cramer(dists, take_sqrt), torch.zeros(2, 3, 1))
+                expected = math.sqrt(7) if take_sqrt else 7.0
+                torch.testing.assert_close(
+                    agent._imag_cramer([left, right], take_sqrt), torch.full((2, 3, 1), expected)
+                )
+
+    def test_cramer_nonuniform_bins_and_equal_mean_distributions(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-3.0, -1.0, 4.0])
+        left = TwoHot(torch.tensor([0.5, 0.5, 0.0]).log().expand(2, 3, -1), bins)
+        right = TwoHot(torch.tensor([0.0, 0.5, 0.5]).log().expand(2, 3, -1), bins)
+        # CDF difference is 0.5 on intervals of widths 2 and 5.
+        torch.testing.assert_close(agent._imag_cramer([left, right]), torch.full((2, 2, 1), 1.75))
+        torch.testing.assert_close(
+            agent._imag_cramer([left, right], take_sqrt=True), torch.full((2, 2, 1), math.sqrt(1.75))
+        )
+        bins = torch.tensor([-2.0, 0.0, 2.0])
+        spread = TwoHot(torch.tensor([0.5, 0.0, 0.5]).log().expand(2, 3, -1), bins)
+        center = TwoHot(torch.tensor([0.0, 1.0, 0.0]).log().expand(2, 3, -1), bins)
+        torch.testing.assert_close(spread.mode(), center.mode())
+        for take_sqrt in (False, True):
+            torch.testing.assert_close(agent._imag_cramer([spread, center], take_sqrt), torch.ones(2, 2, 1))
+
+    def test_cramer_roots_each_pair_before_averaging_and_is_permutation_invariant(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-3.0, -1.0, 0.0, 4.0, 10.0])
+        dists = [TwoHot(prob.log().expand(2, 3, -1), bins) for prob in torch.eye(5)]
+        # All ten point-mass pair distances, independent of the CDF implementation.
+        distances = [2, 3, 7, 13, 1, 5, 11, 4, 10, 6]
+        root_mean = sum(math.sqrt(distance) for distance in distances) / 10
+        self.assertNotAlmostEqual(root_mean, math.sqrt(6.2))
+        for order in (dists, [dists[i] for i in [3, 0, 4, 1, 2]]):
+            torch.testing.assert_close(agent._imag_cramer(order), torch.full((2, 2, 1), 6.2))
+            torch.testing.assert_close(
+                agent._imag_cramer(order, take_sqrt=True), torch.full((2, 2, 1), root_mean)
+            )
+
+    def test_cramer_retains_trajectory_depth_and_excludes_bootstrap(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-1.0, 3.0])
+        left = TwoHot(torch.tensor([1.0, 0.0]).log().expand(2, 3, -1), bins)
+        probabilities = torch.tensor([[[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0]] * 3])
+        right = TwoHot(probabilities.log(), bins)
+        expected = torch.tensor([[[4.0], [0.0]], [[4.0], [4.0]]])
+        for take_sqrt in (False, True):
+            target = expected.sqrt() if take_sqrt else expected
+            score = agent._imag_cramer([left, right], take_sqrt)
+            torch.testing.assert_close(score, target)
+            torch.testing.assert_close(score.mean(dim=0), target.mean(dim=0))
+            changed = probabilities.clone()
+            changed[:, -1] = torch.tensor([1.0, 0.0])
+            torch.testing.assert_close(
+                agent._imag_cramer([left, TwoHot(changed.log(), bins)], take_sqrt), target
+            )
+
+    def test_cramer_is_detached_float32_under_autocast(self):
+        agent = self.make_agent()
+        bins = torch.tensor([-60000.0, 60000.0], dtype=torch.float16, requires_grad=True)
+        logits = [
+            torch.tensor(v, dtype=torch.float16, requires_grad=True)
+            for v in ([0.0, -torch.inf], [-torch.inf, 0.0])
+        ]
+        with torch.autocast(device_type="cpu", dtype=torch.float16):
+            dists = [TwoHot(value.expand(2, 2, -1), bins) for value in logits]
+            for take_sqrt in (False, True):
+                score = agent._imag_cramer(dists, take_sqrt)
+                expected = math.sqrt(120000) if take_sqrt else 120000.0
+                torch.testing.assert_close(score, torch.full((2, 1, 1), expected))
+                self.assertEqual(score.dtype, torch.float32)
+                self.assertFalse(score.requires_grad)
+                torch.testing.assert_close(agent._imag_cramer(dists[:1], take_sqrt), torch.zeros_like(score))
+        self.assertIsNone(bins.grad)
+        for value in logits:
+            self.assertIsNone(value.grad)
+
     def test_loss_gradient_boundaries(self):
         for size, active in [(size, loss) for size in (1, 5) for loss in ("policy", "value", "repval")]:
             with self.subTest(size=size, loss=active):
@@ -449,13 +551,13 @@ class ValueEnsembleTest(unittest.TestCase):
                 self.assert_frozen_sharing(agent)
 
     def test_dynamic_threshold_curve_masks_and_return_normalization(self):
-        for metric in ("wasser", "ucb", "sigma"):
+        for metric in SCORE_METHODS:
             with self.subTest(metric=metric):
                 self._check_dynamic_threshold_curve_masks_and_return_normalization(metric)
 
     def _check_dynamic_threshold_curve_masks_and_return_normalization(self, metric):
         agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=1, metric=metric)
-        score_method = {"wasser": "_imag_wasserstein", "ucb": "_imag_ucb", "sigma": "_imag_sigma"}[metric]
+        score_method = SCORE_METHODS[metric]
         metric_name = f"imag_{metric}"
         agent.dynamic_trunc_quantile = 0.5
         agent.dynamic_trunc_threshold_scale = 2.0
@@ -496,11 +598,11 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertFalse(agent.trunc_kappa.value.requires_grad)
 
     def test_dynamic_gradient_boundaries_on_a_partial_prefix(self):
-        cases = [(m, loss) for m in ("wasser", "ucb", "sigma") for loss in ("policy", "value", "repval")]
+        cases = [(m, loss) for m in SCORE_METHODS for loss in ("policy", "value", "repval")]
         for metric, active in cases:
             with self.subTest(metric=metric, loss=active):
                 agent = self.make_agent(outscale=0.1, trunc_enabled=True, min_horizon=1, metric=metric)
-                score_method = {"wasser": "_imag_wasserstein", "ucb": "_imag_ucb", "sigma": "_imag_sigma"}[metric]
+                score_method = SCORE_METHODS[metric]
                 agent._loss_scales = {key: float(key == active) for key in agent._loss_scales}
                 data, initial = self.make_batch(agent)
                 scores = torch.tensor([0.0, 2.0, 0.0]).reshape(1, 3, 1).expand(8, -1, -1)
@@ -546,13 +648,15 @@ class ValueEnsembleTest(unittest.TestCase):
             self.assertGreater(self.grad_norm(head), 0)
 
     def test_zero_initialized_heads_keep_full_horizon(self):
-        agent = self.make_agent(trunc_enabled=True, min_horizon=1)
-        data, initial = self.make_batch(agent)
-        _, metrics = agent._cal_grad(data, initial)
-        torch.testing.assert_close(metrics["imag_wasser"], torch.zeros(3, 1))
-        self.assertEqual(metrics["dynamic_trunc/threshold"].item(), 0)
-        self.assertEqual(metrics["dynamic_trunc/keep_rate"].item(), 1)
-        self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 3)
+        for metric in SCORE_METHODS:
+            with self.subTest(metric=metric):
+                agent = self.make_agent(trunc_enabled=True, min_horizon=1, metric=metric)
+                data, initial = self.make_batch(agent)
+                _, metrics = agent._cal_grad(data, initial)
+                torch.testing.assert_close(metrics[f"imag_{metric}"], torch.zeros(3, 1))
+                self.assertEqual(metrics["dynamic_trunc/threshold"].item(), 0)
+                self.assertEqual(metrics["dynamic_trunc/keep_rate"].item(), 1)
+                self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 3)
 
     def test_one_random_pair_is_shared_by_bootstrap_and_advantage(self):
         agent = self.make_agent(outscale=0.1)
@@ -611,7 +715,7 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assert_frozen_sharing(agent.to("cpu"))
 
     def test_update_and_checkpoint_roundtrip(self):
-        for size, metric in ((s, m) for s in (1, 2) for m in ("wasser", "ucb")):
+        for size, metric in ((s, m) for s in (1, 2) for m in SCORE_METHODS):
             with self.subTest(size=size, metric=metric):
                 self._check_update_and_checkpoint_roundtrip(size, metric)
 

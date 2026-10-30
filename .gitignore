@@ -131,3 +131,5 @@ dmypy.json
 .vscode
 .clinerules
 AGENTS.md
+run.sh
+run_uv.sh

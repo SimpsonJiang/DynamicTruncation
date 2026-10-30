@@ -54,6 +54,26 @@ python3 train.py model.rep_loss=dreamer model.dynamic_trunc.enabled=false
 ```
 
 `wasser` uses mean pairwise Wasserstein-1 distance on the raw return bins.
+`cramer` uses the squared Cramer score, while `sqrt_cramer` uses the Cramer
+distance. Both compare full-distribution CDFs using the same nonuniform raw
+return bins as W1:
+
+\[
+C_{ij}^{2}=\sum_{b=0}^{D-2}(F_i(b)-F_j(b))^2(x_{b+1}-x_b),\qquad
+u_{\mathrm{cramer}}=\frac{1}{\binom K2}\sum_{i<j}C_{ij}^{2},\qquad
+u_{\mathrm{sqrt\_cramer}}=\frac{1}{\binom K2}\sum_{i<j}\sqrt{C_{ij}^{2}}.
+\]
+
+For `sqrt_cramer`, each pair is square-rooted before averaging. Both scores
+retain individual trajectories and imagination depths for truncation, are
+detached float32, and use the existing threshold EMA and prefix masks.
+No epsilon or extra normalization is added; identical distributions give zero.
+
+```bash
+python3 train.py model.rep_loss=dreamer model.VE_metric=cramer
+python3 train.py model.rep_loss=dreamer model.VE_metric=sqrt_cramer
+```
+
 `ucb` uses all heads' scalar value predictions and the sample standard deviation:
 
 \[
@@ -74,7 +94,7 @@ python3 train.py model.rep_loss=dreamer model.VE_metric=ucb model.imag_horizon=3
 
 For a single-head baseline, set `model.dynamic_trunc.enabled=false` and
 `model.value_ensemble_size=1`. This uses the single head directly for bootstrap
-and advantage. W1 and sigma are zero; UCB equals the
+and advantage. W1, sigma, cramer, and sqrt_cramer are zero; UCB equals the
 single prediction (its standard deviation is defined as zero).
 Dynamic truncation requires at least two heads.
 
@@ -83,10 +103,11 @@ scalar values, in raw return units. It uses the same truncation mechanism;
 `model.beta` does not affect sigma.
 
 Only the selected score is computed and logged: `train/imag_wasser`,
-`train/imag_ucb`, or `train/imag_sigma` in `metrics.jsonl` is an `[H, 1]` array
-averaged over imagination starts, excluding the final bootstrap state.
-TensorBoard records each depth as `train/imag_wasser/step_00`,
-`train/imag_ucb/step_00`, or `train/imag_sigma/step_00`, `step_01`, etc.
+`train/imag_ucb`, `train/imag_sigma`, `train/imag_cramer`, or
+`train/imag_sqrt_cramer` in `metrics.jsonl` is an `[H, 1]` array averaged over
+imagination starts, excluding the final bootstrap state. TensorBoard records
+each depth under the selected metric as `step_00`, `step_01`, etc.
+Cramer scores are independent of `model.beta`, which is used only by UCB.
 The scalar `train/dynamic_trunc/effective_horizon` reports the mean retained length.
 
 In `run.sh`, `VE_metric` and `imag_hori` are forwarded to each worker as

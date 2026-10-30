@@ -16,7 +16,7 @@ beta1: 0.9
 beta2: 0.999
 warmup: 1000
 value_ensemble_size: 5
-VE_metric: wasser
+VE_metric: wasser # wasser / ucb / sigma / cramer / sqrt_cramer
 beta: 0.1
 slow_target_update: 1
 slow_target_fraction: 0.02

@@ -38,8 +38,8 @@ class Dreamer(nn.Module):
         ):
             raise ValueError("model.value_ensemble_size must be a positive integer")
         self.ve_metric = str(config.get("VE_metric", "wasser"))
-        if self.ve_metric not in ("wasser", "ucb", "sigma"):
-            raise ValueError("model.VE_metric must be 'wasser', 'ucb' or 'sigma'")
+        if self.ve_metric not in ("wasser", "ucb", "sigma", "cramer", "sqrt_cramer"):
+            raise ValueError("model.VE_metric must be 'wasser', 'ucb', 'sigma', 'cramer' or 'sqrt_cramer'")
         self.ucb_beta = float(config.get("beta", 0.1))
         if not math.isfinite(self.ucb_beta) or self.ucb_beta < 0:
             raise ValueError("model.beta must be finite and non-negative")
@@ -502,6 +502,8 @@ class Dreamer(nn.Module):
         # (B*T, H, 1): each trajectory gates on its own current-state score.
         if self.ve_metric == "wasser":
             imag_uncertainty = self._imag_wasserstein(imag_value_dist)
+        elif self.ve_metric in ("cramer", "sqrt_cramer"):
+            imag_uncertainty = self._imag_cramer(imag_value_dist, take_sqrt=self.ve_metric == "sqrt_cramer")
         elif self.ve_metric == "ucb":
             imag_uncertainty = self._imag_ucb(imag_values)
         else:
@@ -645,6 +647,23 @@ class Dreamer(nn.Module):
             for j in range(i + 1, len(cdfs)):
                 # Reduce each pair immediately instead of materializing all pairwise distances.
                 total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1, keepdim=True)
+        return total / (len(cdfs) * (len(cdfs) - 1) // 2)
+
+    @torch.no_grad()
+    def _imag_cramer(self, value_dists, take_sqrt=False):
+        """Mean pairwise squared Cramer score, optionally rooted before averaging."""
+        if len(value_dists) == 1:
+            return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
+        # Cache full-distribution CDFs once per head, excluding the bootstrap state.
+        cdfs = [to_f32(dist.probs.detach()[:, :-1]).cumsum(dim=-1)[..., :-1] for dist in value_dists]
+        widths = to_f32(value_dists[0].bins.detach()).diff()
+        total = torch.zeros_like(cdfs[0][..., :1])
+        for i in range(len(cdfs)):
+            for j in range(i + 1, len(cdfs)):
+                distance = ((cdfs[i] - cdfs[j]).square() * widths).sum(dim=-1, keepdim=True)
+                if take_sqrt:
+                    distance = distance.clamp_min(0.0).sqrt()
+                total = total + distance
         return total / (len(cdfs) * (len(cdfs) - 1) // 2)
 
     @torch.no_grad()

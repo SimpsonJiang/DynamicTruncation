@@ -11,13 +11,13 @@ PROCS_PER_GPU=2 # Maximum concurrent training jobs on each GPU.
 enable_dny_trunc=true
 val_ens_num=5
 VE_metric=wasser
-#wasser, ucb
-imag_hori=32
+# wasser / ucb / sigma / cramer / sqrt_cramer
+imag_hori=15
 METHOD=VE_${VE_metric}_H${imag_hori} # Value Ensemble
 
 GPU_IDs=(
-    4
-    5
+    6
+    7
 )
 seeds=(
     1
