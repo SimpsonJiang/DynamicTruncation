@@ -203,8 +203,7 @@ def main():
             visual = env.unwrapped._env.physics.model.vis.global_
             visual.offwidth = max(visual.offwidth, args.width)
             visual.offheight = max(visual.offheight, args.height)
-        state_spec = env.get_state_spec() if config.model.get("state_decoder", {}).get("enabled", False) else None
-        agent = Dreamer(config.model, env.observation_space, env.action_space, state_spec=state_spec).to(device)
+        agent = Dreamer(config.model, env.observation_space, env.action_space).to(device)
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         agent.load_state_dict(saved["agent_state_dict"], strict=True)
         del saved
