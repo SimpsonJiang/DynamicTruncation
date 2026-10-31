@@ -10,10 +10,13 @@ PROCS_PER_GPU=2 # Maximum concurrent training jobs on each GPU.
 
 enable_dny_trunc=true
 val_ens_num=5
-uncer_metric=wasser
 # wasser / ucb / sigma / cramer / sqrt_cramer
-imag_hori=15
-METHOD=VE_${uncer_metric}_H${imag_hori} # Value Ensemble
+uncer_metric=(
+    wasser
+)
+imag_hori=(
+    15
+)
 
 GPU_IDs=(
     6
@@ -57,8 +60,8 @@ PYTHON=$(command -v python) || { echo "Error: python is required." >&2; exit 1; 
 printf 'Conda environment: %s (Python: %s)\n' "$CONDA_ENV" "$PYTHON"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-if (( ${#GPU_IDs[@]} == 0 || ${#tasks[@]} == 0 || ${#seeds[@]} == 0 )); then
-    echo "Error: GPU_IDs, tasks and seeds must all be non-empty." >&2
+if (( ${#GPU_IDs[@]} == 0 || ${#tasks[@]} == 0 || ${#seeds[@]} == 0 || ${#uncer_metric[@]} == 0 || ${#imag_hori[@]} == 0 )); then
+    echo "Error: GPU_IDs, tasks, seeds, uncer_metric and imag_hori must all be non-empty." >&2
     exit 1
 fi
 if [[ ! $PROCS_PER_GPU =~ ^[1-9][0-9]*$ ]]; then
@@ -76,12 +79,13 @@ done
 
 # Each generated worker runs its assigned jobs sequentially inside tmux.
 train_job() {
-    local task=$1 seed=$2 status
+    local task=$1 seed=$2 uncer_metric=$3 imag_hori=$4 status
+    local METHOD="VE_${uncer_metric}_H${imag_hori}"
     if [[ -z ${TMUX:-} ]]; then
         echo "Error: training must run inside tmux." >&2
         exit 1
     fi
-    printf '\n[GPU %s] Starting task=%s seed=%s\n' "$GPU_ID" "$task" "$seed"
+    printf '\n[GPU %s] Starting method=%s task=%s seed=%s\n' "$GPU_ID" "$METHOD" "$task" "$seed"
 # -------------------------------python cmd-----------------------------
     if CUDA_VISIBLE_DEVICES="$GPU_ID" MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID="$GPU_ID" \
         "$PYTHON" train.py \
@@ -97,10 +101,10 @@ train_job() {
             "model.uncer_metric=${uncer_metric}" \
             "model.imag_horizon=${imag_hori}" \
             "seed=$seed"; then
-        printf '[GPU %s] Finished task=%s seed=%s\n' "$GPU_ID" "$task" "$seed"
+        printf '[GPU %s] Finished method=%s task=%s seed=%s\n' "$GPU_ID" "$METHOD" "$task" "$seed"
     else
         status=$?
-        printf '[GPU %s] FAILED task=%s seed=%s (exit %s)\n' "$GPU_ID" "$task" "$seed" "$status" >&2
+        printf '[GPU %s] FAILED method=%s task=%s seed=%s (exit %s)\n' "$GPU_ID" "$METHOD" "$task" "$seed" "$status" >&2
         FAILED=1
     fi
 }
@@ -108,7 +112,7 @@ train_job() {
 WORKER_DIR=$(mktemp -d /tmp/r2dreamer-workers.XXXXXX)
 SESSION="r2dreamer_${DATE}_$(date +%H%M%S)_$$"
 gpu_count=${#GPU_IDs[@]}
-total_jobs=$(( ${#tasks[@]} * ${#seeds[@]} ))
+total_jobs=$(( ${#uncer_metric[@]} * ${#imag_hori[@]} * ${#tasks[@]} * ${#seeds[@]} ))
 worker_count=$(( gpu_count * PROCS_PER_GPU ))
 if (( worker_count > total_jobs )); then
     worker_count=$total_jobs
@@ -137,25 +141,27 @@ for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
             fi
         done
         printf 'source %q\nconda activate %q\n' "$CONDA_SH" "$CONDA_ENV"
-        printf 'GPU_ID=%q\nPYTHON=%q\nMODAL=%q\nMETHOD=%q\nDATE=%q\nFAILED=0\n' \
-            "$gpu" "$PYTHON" "$MODAL" "$METHOD" "$DATE"
+        printf 'GPU_ID=%q\nPYTHON=%q\nMODAL=%q\nDATE=%q\nFAILED=0\n' \
+            "$gpu" "$PYTHON" "$MODAL" "$DATE"
         printf 'enable_dny_trunc=%q\nval_ens_num=%q\n' \
             "$enable_dny_trunc" "$val_ens_num"
-        printf 'uncer_metric=%q\nimag_hori=%q\n' \
-            "$uncer_metric" "$imag_hori"
         declare -f train_job
     } > "$worker"
 
     assigned=$(( total_jobs / worker_count + (worker_index < total_jobs % worker_count) ))
     printf '\nGPU %s, worker %s: %s jobs\n' "$gpu" "$slot" "$assigned"
     job_index=0
-    for task in "${tasks[@]}"; do
-        for seed in "${seeds[@]}"; do
-            if (( job_index % worker_count == worker_index )); then
-                printf '  task=%s seed=%s\n' "$task" "$seed"
-                printf 'train_job %q %q\n' "$task" "$seed" >> "$worker"
-            fi
-            job_index=$((job_index + 1))
+    for metric in "${uncer_metric[@]}"; do
+        for horizon in "${imag_hori[@]}"; do
+            for task in "${tasks[@]}"; do
+                for seed in "${seeds[@]}"; do
+                    if (( job_index % worker_count == worker_index )); then
+                        printf '  metric=%s horizon=%s task=%s seed=%s\n' "$metric" "$horizon" "$task" "$seed"
+                        printf 'train_job %q %q %q %q\n' "$task" "$seed" "$metric" "$horizon" >> "$worker"
+                    fi
+                    job_index=$((job_index + 1))
+                done
+            done
         done
     done
     printf 'printf "\\n[GPU %%s] All assigned jobs completed; failure flag=%%s\\n" "$GPU_ID" "$FAILED"\nexit "$FAILED"\n' >> "$worker"
