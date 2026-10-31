@@ -12,15 +12,16 @@ enable_dny_trunc=true
 val_ens_num=5
 # wasser / ucb / sigma / cramer / sqrt_cramer
 uncer_metric=(
-    wasser
+    ucb
+    sigma
 )
 imag_hori=(
     15
 )
 
 GPU_IDs=(
-    6
-    7
+    4
+    5
 )
 seeds=(
     1
@@ -28,9 +29,7 @@ seeds=(
     100
 )
 tasks=(
-    dmc_finger_spin
-    dmc_hopper_hop
-    dmc_quadruped_run
+    dmc_walker_walk
 )
 
 
