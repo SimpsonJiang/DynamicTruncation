@@ -19,7 +19,6 @@ from dreamer import Dreamer
 from networks import MLPHead
 from truncation import cal_ens_uncertainty
 
-
 SCORE_METHODS = {
     "wasser": "_imag_wasserstein",
     "ucb": "_imag_ucb",
@@ -186,19 +185,19 @@ class ValueEnsembleTest(unittest.TestCase):
             ]
         ).unsqueeze(-1)
         expected = torch.tensor([[[5.0], [7.0]], [[3.0], [3.0]]])
-        torch.testing.assert_close(truncation._imag_ucb(values, beta=agent.config["beta"]), expected)
+        torch.testing.assert_close(truncation._imag_ucb(values, beta=agent.ucb_beta), expected)
         torch.testing.assert_close(
-            truncation._imag_ucb(values, beta=agent.config["beta"]).mean(dim=0), torch.tensor([[4.0], [5.0]])
+            truncation._imag_ucb(values, beta=agent.ucb_beta).mean(dim=0), torch.tensor([[4.0], [5.0]])
         )
         values[:, :, -1] *= 100
-        torch.testing.assert_close(truncation._imag_ucb(values, beta=agent.config["beta"]), expected)
-        agent.config["beta"] = 0
+        torch.testing.assert_close(truncation._imag_ucb(values, beta=agent.ucb_beta), expected)
+        agent.ucb_beta = 0
         torch.testing.assert_close(
-            truncation._imag_ucb(values, beta=agent.config["beta"]), torch.tensor([[[1.0], [3.0]], [[3.0], [-1.0]]])
+            truncation._imag_ucb(values, beta=agent.ucb_beta), torch.tensor([[[1.0], [3.0]], [[3.0], [-1.0]]])
         )
-        agent.config["beta"] = 7
+        agent.ucb_beta = 7
         torch.testing.assert_close(
-            truncation._imag_ucb(torch.full_like(values, -4), beta=agent.config["beta"]), torch.full((2, 2, 1), -4.0)
+            truncation._imag_ucb(torch.full_like(values, -4), beta=agent.ucb_beta), torch.full((2, 2, 1), -4.0)
         )
 
     def test_ucb_is_detached_float32_and_handles_single_head_and_horizon_one(self):
@@ -206,8 +205,8 @@ class ValueEnsembleTest(unittest.TestCase):
         values = torch.tensor([[-60000.0, 10.0], [60000.0, -10.0]], dtype=torch.float16).reshape(2, 1, 2, 1)
         values.requires_grad_()
         with torch.autocast(device_type="cpu", dtype=torch.float16):
-            score = truncation._imag_ucb(values, beta=agent.config["beta"])
-            single = truncation._imag_ucb(values[:1], beta=agent.config["beta"])
+            score = truncation._imag_ucb(values, beta=agent.ucb_beta)
+            single = truncation._imag_ucb(values[:1], beta=agent.ucb_beta)
         self.assertEqual(score.shape, (1, 1, 1))
         self.assertEqual(score.dtype, torch.float32)
         self.assertFalse(score.requires_grad)
@@ -303,7 +302,7 @@ class ValueEnsembleTest(unittest.TestCase):
                 uncertainty.assert_called_once()
                 dists, all_values, selected_metric = uncertainty.call_args.args
                 self.assertEqual(selected_metric, metric)
-                self.assertEqual(uncertainty.call_args.kwargs, {"beta": agent.config["beta"]})
+                self.assertEqual(uncertainty.call_args.kwargs, {"beta": agent.ucb_beta})
                 self.assertEqual(len(dists), 5)
                 self.assertEqual(all_values.shape, (5, 8, horizon + 1, 1))
                 name = f"imag_{metric}"
@@ -450,6 +449,32 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertIsNone(left_logits.grad)
         self.assertIsNone(right_logits.grad)
 
+    def test_wasserstein_does_not_amplify_roundoff_in_empty_tails(self):
+        bins = torch.tensor([-485165184.0, -1.0, 0.0, 1.0, 485165184.0], requires_grad=True)
+        logits = torch.tensor(
+            [-torch.inf, 1.9940087795257568, -8.350927352905273, 3.409693479537964, -torch.inf],
+            requires_grad=True,
+        )
+        point_mass = torch.tensor([-torch.inf, -torch.inf, 0.0, -torch.inf, -torch.inf], requires_grad=True)
+        # Both distributions are supported on [-1, 1], and Q is a point mass at zero.
+        # W1(P, Q) = E_P[abs(X)] <= 1, including when the remote bins have huge gaps.
+        probs = logits.detach()[1:4].double().softmax(dim=-1)
+        expected = torch.full((2, 3, 1), (probs[0] + probs[2]).item())
+        for autocast_enabled in (False, True):
+            with (
+                self.subTest(autocast=autocast_enabled),
+                torch.autocast(device_type="cpu", dtype=torch.float16, enabled=autocast_enabled),
+            ):
+                dists = [TwoHot(value.expand(2, 4, -1), bins) for value in (logits, point_mass)]
+                score = cal_ens_uncertainty(dists, None, "wasser")
+            torch.testing.assert_close(score, expected, rtol=1e-6, atol=1e-6)
+            self.assertTrue((score <= 1.0 + 1e-6).all())
+            self.assertEqual(score.dtype, torch.float32)
+            self.assertFalse(score.requires_grad)
+        self.assertIsNone(logits.grad)
+        self.assertIsNone(point_mass.grad)
+        self.assertIsNone(bins.grad)
+
     def test_wasserstein_logging_preserves_losses_and_gradients(self):
         agent = self.make_agent(outscale=0.1)
         data, initial = self.make_batch(agent)
@@ -558,6 +583,34 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertIsNone(bins.grad)
         for value in logits:
             self.assertIsNone(value.grad)
+
+    def test_cramer_does_not_amplify_roundoff_in_empty_tails(self):
+        bins = torch.tensor([-485165184.0, -1.0, 0.0, 1.0, 485165184.0], requires_grad=True)
+        logits = torch.tensor(
+            [-torch.inf, 1.9940087795257568, -8.350927352905273, 3.409693479537964, -torch.inf],
+            requires_grad=True,
+        )
+        point_mass = torch.tensor([-torch.inf, -torch.inf, 0.0, -torch.inf, -torch.inf], requires_grad=True)
+        # Against a point mass at zero, the two unit-width intervals contribute
+        # P(X=-1)^2 and P(X=1)^2; the remote empty tails contribute exactly zero.
+        probs = logits.detach()[1:4].double().softmax(dim=-1)
+        squared_distance = (probs[0].square() + probs[2].square()).item()
+        for metric in ("cramer", "sqrt_cramer"):
+            expected_value = math.sqrt(squared_distance) if metric == "sqrt_cramer" else squared_distance
+            expected = torch.full((2, 3, 1), expected_value)
+            for autocast_enabled in (False, True):
+                with (
+                    self.subTest(metric=metric, autocast=autocast_enabled),
+                    torch.autocast(device_type="cpu", dtype=torch.float16, enabled=autocast_enabled),
+                ):
+                    dists = [TwoHot(value.expand(2, 4, -1), bins) for value in (logits, point_mass)]
+                    score = cal_ens_uncertainty(dists, None, metric)
+                    torch.testing.assert_close(score, expected, rtol=1e-7, atol=1e-7)
+                    self.assertEqual(score.dtype, torch.float32)
+                    self.assertFalse(score.requires_grad)
+        self.assertIsNone(logits.grad)
+        self.assertIsNone(point_mass.grad)
+        self.assertIsNone(bins.grad)
 
     def test_loss_gradient_boundaries(self):
         for size, active in [(size, loss) for size in (1, 5) for loss in ("policy", "value", "repval")]:

@@ -1,0 +1,104 @@
+{
+  "status": "analysis_complete_test_interface_fixed",
+  "review_date": "2026-11-02",
+  "timezone": "Asia/Shanghai",
+  "mode": "source_review_and_cpu_unit_tests",
+  "repository_revision": "a10481d60fa226a6238eba72a21f66ff1c2ff9b6",
+  "scope": "Current working tree: architecture, replay/gradient contracts, ensemble/truncation, config/launchers, evaluation, tests, and contributor guidance.",
+  "preexisting_changes": [
+    "buffer.py modified",
+    "run_uv.sh modified",
+    "uv_run.sh untracked",
+    "figures/ untracked"
+  ],
+  "source_code_modified": false,
+  "tests_modified": false,
+  "runtime_execution": {
+    "training_started": false,
+    "evaluation_started": false,
+    "environment_instantiated": false,
+    "cpu_unit_tests": true
+  },
+  "validation": {
+    "python": "3.11.17",
+    "command": "CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests -v",
+    "exit_code": 1,
+    "tests_run": 41,
+    "errors": 12,
+    "affected_test_methods": 3,
+    "elapsed_seconds": 23.646,
+    "cause": "Tests read agent.config['beta'], but Dreamer stores ucb_beta and has no config attribute.",
+    "log": "unittest.log"
+  },
+  "evidence_basis": [
+    "Current source and Hydra configuration",
+    "Existing run .hydra/config.yaml, console.log and metrics.jsonl",
+    "One CPU unittest execution"
+  ],
+  "existing_run_snapshot": {
+    "path": "logdir/new_VE_baseline_H15/dmc_finger_spin_proprio_s1_1102",
+    "rep_loss": "dreamer",
+    "value_ensemble_size": 5,
+    "imag_horizon": 15,
+    "dynamic_trunc_enabled": false,
+    "seed": 1,
+    "observed_metric_step": 12128,
+    "learning_rate": 4e-05,
+    "value_ensemble_std": 0.028880974277853966,
+    "training_completion_verified": false
+  },
+  "limitations": [
+    "No GPU compile or real environment/replay integration validation.",
+    "No full experiment resume test.",
+    "No new training, benchmark, throughput or convergence measurements.",
+    "No external paper/upstream version parity verification.",
+    "Current source observations may differ from earlier analysis snapshots."
+  ],
+  "artifacts": [
+    "AGENTS.md",
+    "analysis_outputs/review_20261102/SUMMARY.md",
+    "analysis_outputs/review_20261102/RISKS.md",
+    "analysis_outputs/review_20261102/status.json",
+    "analysis_outputs/review_20261102/unittest.log",
+    "analysis_outputs/review_20261102/unittest_after_fix.log"
+  ],
+  "historical_reports_preserved": true,
+  "source_sha256": {
+    "train.py": "d5d008927f0c50ada24e691da3e7c396bdcbcdd7d8a9222c0890de17f8e9e11b",
+    "trainer.py": "ea8b4e0ed987d91cbecd53f0b5a2f1b743268173a14257abee47d1ad7b490b68",
+    "buffer.py": "6f169ccec99d1746781e589fd132f5740439893294626e5ef412321cadc05942",
+    "dreamer.py": "81bd276b8f1c52b5f77ec7ab9b525c7972ea951c85901ab04795aab1d22fe6d7",
+    "truncation.py": "df6ae456d37fbbebad98bb3b0ce0b46bf8eb7dbfad0801bfa76fc097f8bd1664",
+    "rssm.py": "b47c7524b3f314f3943707ea912e863c0550f38bc85e4cd00570351c1fa3f287",
+    "networks.py": "e3108571153fd1d7d0d717418330adb4701441cf8ef5e3f86c019cfd531f3714",
+    "distributions.py": "adf1107fc999e2f61a92609b7c00c0db3e7fc7cf488e5f1e42d6150a58c3543d",
+    "tools.py": "981ed61d55b0c8c35e1ee96258d5be0c222a41c9428ba25dab13104bea328e4b",
+    "eval_video.py": "3c607513c753738bc2e072828a7529a84f2f3c9e0d8ac868a96cc731dc1cb86d",
+    "envs/__init__.py": "17d5c6acb5c8103e8a1e2627e07792a882ef017a578cf0043cc4c36a0ef2700f",
+    "envs/dmc.py": "5c55fe20dfeb4988e8a0bfde2a1f86fb99d0a101ca2190712de3a60158d621d4",
+    "envs/parallel.py": "dec5590732136287d586c936c8724cadbf86ca2c7adc8619e3caa85eb928f598",
+    "envs/wrappers.py": "d413ec35b027993bc191b012a5018091dda1074ad269ed9559a0ec10424869a3",
+    "configs/configs.yaml": "46c8805285ee7a525092cce7abfde731ec51d5dd3464abb4e6d8cc9332855852",
+    "configs/model/_base_.yaml": "666bd734f1eedccd23d2ec28dbe0fd3a2a30ee258d611e604c25228067bf6b23",
+    "configs/model/size12M.yaml": "464475444f3652d04ab17f427aa22b0572b6c8e458d25494c116c759828bfe24",
+    "configs/env/dmc_proprio.yaml": "4c91108a704c639cf71640b0aa82ea3c12fca6cb8c76ff6bbd158c354b0d2e2d",
+    "run_uv.sh": "6bb7ba699f0fe3a5f7054217802c47adb68000f76ecde21b33bc571355cb1ed9",
+    "uv_run.sh": "78087df982af80d5fe4f0973bf8052af90ba4428fd3d034e99da0920ad98316b",
+    "tests/test_value_ensemble.py": "9a16802a85e41c3f223e4b54aa8c0f27a696542104a7f5ec328bcd5e2aa9c1d4",
+    "tests/test_dynamic_truncation.py": "1e13efad528ad152397cea3b7dd790c5868470f8fa1061487744be597baa1a7f",
+    "tests/test_vector_logging.py": "fccb5bf20ff2ce70d2297489efc0943d28eadd7487dfdd01f0368604c5044abb"
+  },
+  "follow_up": {
+    "date": "2026-11-02",
+    "changed_file": "tests/test_value_ensemble.py",
+    "change": "Replace 10 obsolete agent.config[\"beta\"] reads/writes with agent.ucb_beta. Training implementation unchanged.",
+    "command": "CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests -v",
+    "exit_code": 0,
+    "tests_run": 41,
+    "errors": 0,
+    "failures": 0,
+    "elapsed_seconds": 24.601,
+    "log": "unittest_after_fix.log",
+    "initial_validation_preserved": true
+  }
+}

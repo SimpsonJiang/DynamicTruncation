@@ -45,25 +45,36 @@ def _imag_sigma(imag_value):
 
 @torch.no_grad()
 def _imag_wasserstein(value_dists):
-    """Per-state mean pairwise W1 on raw return bins, excluding bootstrap."""
+    """Mean pairwise W1: float64 softmax/CDF/integration, float32 output."""
     if len(value_dists) == 1:
         return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
-    cdfs = [dist.probs.detach()[:, :-1].to(dtype=torch.float32).cumsum(dim=-1)[..., :-1] for dist in value_dists]
-    widths = value_dists[0].bins.detach().to(dtype=torch.float32).diff()
+    # Recompute probabilities: casting float32 softmax output retains mass errors
+    # that the large raw-return bin gaps can amplify into spurious distances.
+    cdfs = [
+        dist.logits.detach()[:, :-1].to(dtype=torch.float64).softmax(dim=-1).cumsum(dim=-1)[..., :-1]
+        for dist in value_dists
+    ]
+    widths = value_dists[0].bins.detach().to(dtype=torch.float64).diff()
     total = torch.zeros_like(cdfs[0][..., :1])
     for i in range(len(cdfs)):
         for j in range(i + 1, len(cdfs)):
             total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1, keepdim=True)
-    return total / (len(cdfs) * (len(cdfs) - 1) // 2)
+    return (total / (len(cdfs) * (len(cdfs) - 1) // 2)).to(dtype=torch.float32)
 
 
 @torch.no_grad()
 def _imag_cramer(value_dists, take_sqrt=False):
-    """Mean pairwise squared Cramer score, optionally rooted before averaging."""
+    """Mean pairwise squared Cramer score, optionally rooted before averaging.
+
+    Softmax, CDF, integration, and optional roots use float64; output is float32.
+    """
     if len(value_dists) == 1:
         return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
-    cdfs = [dist.probs.detach()[:, :-1].to(dtype=torch.float32).cumsum(dim=-1)[..., :-1] for dist in value_dists]
-    widths = value_dists[0].bins.detach().to(dtype=torch.float32).diff()
+    cdfs = [
+        dist.logits.detach()[:, :-1].to(dtype=torch.float64).softmax(dim=-1).cumsum(dim=-1)[..., :-1]
+        for dist in value_dists
+    ]
+    widths = value_dists[0].bins.detach().to(dtype=torch.float64).diff()
     total = torch.zeros_like(cdfs[0][..., :1])
     for i in range(len(cdfs)):
         for j in range(i + 1, len(cdfs)):
@@ -71,7 +82,7 @@ def _imag_cramer(value_dists, take_sqrt=False):
             if take_sqrt:
                 distance = distance.clamp_min(0.0).sqrt()
             total = total + distance
-    return total / (len(cdfs) * (len(cdfs) - 1) // 2)
+    return (total / (len(cdfs) * (len(cdfs) - 1) // 2)).to(dtype=torch.float32)
 
 
 class ThresholdEMA(nn.Module):

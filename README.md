@@ -129,6 +129,10 @@ its assigned queue sequentially; the tmux session is deleted after all workers e
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
+For offline physics-state decoding from frozen Dreamer features, see
+[`docs/physics_probe.md`](docs/physics_probe.md). The probe provides separate state-restoration,
+data-collection, decoder-training, and posterior/imagination evaluation commands.
+
 
 ## Available Benchmarks
 At the moment, the following benchmarks are available in this repository.

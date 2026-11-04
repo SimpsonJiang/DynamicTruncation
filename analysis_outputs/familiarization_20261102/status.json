@@ -1,0 +1,32 @@
+{
+  "status": "complete",
+  "mode": "static_read_only_analysis",
+  "review_date": "2026-11-02",
+  "timezone": "Asia/Shanghai",
+  "repository_revision": "7c499a0a6de330e50a24f7419c521adf88c260d1",
+  "working_tree_dirty": true,
+  "source_code_modified": false,
+  "tests_modified": false,
+  "runtime_execution": {
+    "training_started": false,
+    "evaluation_started": false,
+    "tests_run": false,
+    "environment_instantiated": false
+  },
+  "evidence_basis": ["current source", "saved Hydra config", "existing metrics.jsonl and console.log", "historical test log, explicitly not rerun"],
+  "confirmed_documentation_drift": ["run_uv.sh now enables truncation", "Buffer.sample action shift currently lacks the documented clone"],
+  "existing_run_snapshot": {
+    "path": "logdir/new_VE_wasser_H15/dmc_finger_spin_proprio_s1_1102",
+    "training_metric_step": 17120,
+    "effective_horizon": 14.248046875,
+    "keep_rate": 0.9498698115348816,
+    "value_ensemble_std": 0.019734947010874748,
+    "learning_rate": 0.00004,
+    "latest_written_eval_step": 10016,
+    "latest_written_eval_score": 10.90000057220459,
+    "checkpoint_present_at_inspection": false,
+    "process_liveness_checked": false
+  },
+  "artifacts": ["SUMMARY.md", "RISKS.md", "status.json"],
+  "historical_reports_preserved": true
+}
