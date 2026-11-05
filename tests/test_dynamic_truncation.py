@@ -4,10 +4,144 @@ import unittest
 import torch
 
 from dreamer import Dreamer
-from truncation import ThresholdEMA, build_truncation_mask, mask_to_last, normalized_mask
+from truncation import (
+    AdvantageScaleEMA,
+    ThresholdEMA,
+    advantage_drop_fractions,
+    advantage_truncation_score,
+    build_truncation_mask,
+    mask_to_last,
+    normalized_mask,
+)
 
 
 class DynamicTruncationTest(unittest.TestCase):
+    def test_advantage_score_sign_monotonicity_bounds_and_detachment(self):
+        advantage = torch.tensor([-100.0, -1.0, 0.0, 1.0, 100.0], requires_grad=True).reshape(1, 5, 1)
+        uncertainty = torch.full_like(advantage, 2.0, requires_grad=True)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            for mode in ("positive_only", "signed"):
+                score = advantage_truncation_score(uncertainty, advantage, mode=mode)
+                self.assertFalse(score.requires_grad)
+                self.assertEqual(score.dtype, torch.float32)
+                self.assertTrue((score[:, 1:] <= score[:, :-1]).all())
+                self.assertTrue(((score >= 1) & (score <= 4)).all())
+                self.assertEqual(score[0, 2, 0].item(), 2)
+                self.assertEqual(score[0, -1, 0].item(), 1)
+                if mode == "positive_only":
+                    torch.testing.assert_close(score[:, :3], uncertainty[:, :3], rtol=0, atol=0)
+                else:
+                    self.assertEqual(score[0, 0, 0].item(), 4)
+                    self.assertAlmostEqual(score[0, 1, 0].item(), 3.39075, places=4)
+        zero = advantage_truncation_score(torch.zeros_like(advantage), advantage)
+        torch.testing.assert_close(zero, torch.zeros_like(zero))
+
+    def test_advantage_identity_and_invalid_scores_respect_forced_prefix(self):
+        uncertainty = torch.tensor([0.1, 0.2, 0.3, 0.4]).reshape(1, 4, 1)
+        advantage = torch.tensor([torch.nan, torch.inf, -torch.inf, 1.0]).reshape(1, 4, 1)
+        torch.testing.assert_close(
+            advantage_truncation_score(uncertainty, None, mode="off"), uncertainty, rtol=0, atol=0
+        )
+        for mode in ("positive_only", "signed"):
+            torch.testing.assert_close(
+                advantage_truncation_score(uncertainty, advantage, mode=mode, max_factor=1),
+                uncertainty,
+                rtol=0,
+                atol=0,
+            )
+            score = advantage_truncation_score(uncertainty, advantage, mode=mode)
+            self.assertTrue(torch.isinf(score[:, :3]).all())
+            self.assertFalse(torch.isnan(score).any())
+            mask = build_truncation_mask(score, torch.tensor(1.0), min_horizon=2)
+            self.assertEqual(mask.flatten().tolist(), [True, True, False, False])
+        invalid_u = torch.tensor([torch.nan, torch.inf, -torch.inf, -1.0])
+        self.assertTrue(torch.isinf(advantage_truncation_score(invalid_u, torch.ones(4))).all())
+
+    def test_advantage_scale_lag_zero_invalid_and_checkpoint(self):
+        ema = AdvantageScaleEMA(quantile=0.5, decay=0.5)
+        invalid = torch.tensor([torch.nan, torch.inf, -torch.inf])
+        _, scale = ema(invalid)
+        self.assertAlmostEqual(scale.item(), 1e-6)
+        self.assertFalse(ema.initialized)
+        self.assertEqual(ema.value.item(), 0)
+        normalized, scale = ema(torch.tensor([-2.0, 4.0, torch.nan], requires_grad=True))
+        self.assertEqual(scale.item(), 3)
+        torch.testing.assert_close(normalized[:2], torch.tensor([-2 / 3, 4 / 3]))
+        self.assertFalse(normalized.requires_grad)
+        _, scale = ema(torch.tensor([10.0]))
+        self.assertEqual(scale.item(), 3)
+        self.assertEqual(ema.value.item(), 6.5)
+        ema(invalid)
+        self.assertEqual(ema.value.item(), 6.5)
+        checkpoint = io.BytesIO()
+        torch.save(ema.state_dict(), checkpoint)
+        checkpoint.seek(0)
+        restored = AdvantageScaleEMA(quantile=0.5, decay=0.5)
+        restored.load_state_dict(torch.load(checkpoint, weights_only=True))
+        normalized, scale = restored(torch.zeros(5))
+        self.assertEqual(scale.item(), 6.5)
+        self.assertEqual(restored.value.item(), 3.25)
+        torch.testing.assert_close(normalized, torch.zeros(5))
+        normalized, scale = AdvantageScaleEMA()(torch.zeros(5))
+        self.assertTrue(torch.isfinite(normalized).all())
+        self.assertAlmostEqual(scale.item(), 1e-6)
+
+    def test_advantage_drop_fractions_use_weight_sign_and_actual_mask(self):
+        advantage = torch.tensor([2.0, 4.0, -3.0, -6.0, torch.nan], requires_grad=True)
+        weight = torch.tensor([1.0, 2.0, 3.0, 1.0, 5.0], requires_grad=True)
+        mask = torch.tensor([True, False, True, False, False])
+        positive, negative = advantage_drop_fractions(advantage, weight, mask)
+        torch.testing.assert_close(positive, torch.tensor(0.8))
+        torch.testing.assert_close(negative, torch.tensor(0.4))
+        self.assertFalse(positive.requires_grad or negative.requires_grad)
+        for a, w, m in (
+            (advantage, weight, torch.ones_like(mask)),
+            (torch.zeros(5), weight, mask),
+            (advantage, torch.zeros(5), mask),
+        ):
+            for fraction in advantage_drop_fractions(a, w, m):
+                self.assertEqual(fraction.item(), 0)
+
+    def test_advantage_gate_cpu_compile_matches_eager_across_warmup(self):
+        torch.compiler.reset()
+        eager = AdvantageScaleEMA(quantile=0.5, decay=0.5)
+        compiled_ema = AdvantageScaleEMA(quantile=0.5, decay=0.5)
+
+        def gate(ema, uncertainty, advantage, active):
+            normalized, scale = ema(advantage)
+            score = advantage_truncation_score(uncertainty, normalized, mode="signed")
+            mask = build_truncation_mask(score, uncertainty.new_tensor(1.0), 1)
+            if not active:
+                mask = torch.ones_like(mask)
+            return normalized, scale, score, mask
+
+        compiled = torch.compile(gate, backend="eager")
+        uncertainty = torch.tensor([0.5, 1.4, 0.5]).reshape(1, 3, 1)
+        for active, values in ((False, [0.0, 2.0, -1.0]), (True, [1.0, -3.0, 2.0]), (True, [0.0] * 3)):
+            advantage = torch.tensor(values).reshape(1, 3, 1)
+            expected = gate(eager, uncertainty, advantage, active)
+            actual = compiled(compiled_ema, uncertainty, advantage, active)
+            for left, right in zip(actual, expected):
+                torch.testing.assert_close(left, right)
+            torch.testing.assert_close(compiled_ema.value, eager.value)
+        torch.compiler.reset()
+
+    def test_invalid_advantage_configuration(self):
+        for mode in ("unknown", None):
+            with self.assertRaisesRegex(ValueError, "advantage.mode"):
+                advantage_truncation_score(torch.ones(1), torch.ones(1), mode=mode)
+        for factor in (0, 0.9, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "max_factor"):
+                advantage_truncation_score(torch.ones(1), torch.ones(1), max_factor=factor)
+        for key, values in {
+            "quantile": [-0.1, 1.1, float("nan")],
+            "decay": [-0.1, 1.0, float("nan")],
+            "eps": [0, -1, float("inf"), float("nan")],
+        }.items():
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    AdvantageScaleEMA(**{key: value})
+
     def test_first_crossing_is_per_trajectory_and_does_not_recover(self):
         scores = torch.tensor([[0.0, 1.0, 2.0, 0.0], [0.0, 2.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
         mask = build_truncation_mask(scores.unsqueeze(-1), torch.tensor(1.0), min_horizon=0)

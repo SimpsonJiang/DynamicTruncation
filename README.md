@@ -59,6 +59,70 @@ To use the full imagination horizon throughout training:
 python3 train.py model.rep_loss=dreamer model.dynamic_trunc.enabled=false
 ```
 
+Advantage-aware truncation is optional. The base config and older configs default
+to `model.dynamic_trunc.advantage.mode=off`; `uv_run.sh` explicitly selects
+`positive_only`. `signed` also tightens the threshold for negative advantages.
+Supported uncertainty metrics are `wasser`, `cramer`, `sqrt_cramer`, and `sigma`;
+`ucb` is rejected when this adjustment is enabled because its score can be negative.
+
+The gate first computes full-horizon lambda returns (using the existing lambda,
+normally 0.95, and bootstrap at H) and `delta_full = return_full - value` on the
+same imagined trajectory and randomly selected value pair. An independent EMA
+normalizes this advantage without mean subtraction. It uses the previous EMA of
+the batch/time absolute-advantage quantile (default 0.9), decay 0.99 and a scale
+floor of 1e-6; the first valid batch initializes the EMA. Nonfinite entries are
+excluded from this quantile, and an entirely invalid batch leaves the EMA unchanged.
+
+For normalized full advantage `a` and original uncertainty `U`, the decision score is
+`U / max_factor ** tanh(a)` in `signed` mode. `positive_only` replaces
+`a` with `max(a, 0)`. The default `max_factor=2.0` bounds the multiplier to
+`[0.5, 2]` for `signed`, or `[0.5, 1]` for `positive_only`. This dimensionless
+multiplier preserves the units of the uncertainty score, including symlog-bin
+distances. `max_factor=1` returns the original uncertainty exactly, even for invalid
+advantages. Otherwise nonfinite advantages produce an invalid score that crosses
+the threshold, subject to the forced minimum prefix.
+
+The threshold EMA still uses **original uncertainty**, not the adjusted score.
+After deciding the mask, actor/critic learning uses the original truncated-return
+procedure and the actor's existing return normalization (updated only once).
+During warmup, both EMAs update, all positions are retained, and the already
+computed full return is reused. `off` adds no gate return computation or model
+buffers. Enabled modes save the independent scale EMA in the model state dict;
+old configs/checkpoints remain strictly loadable in `off` mode. Loading an old
+checkpoint into an enabled mode requires explicitly initializing the new scale
+state; this does not add a complete experiment-resume facility.
+
+```bash
+python3 train.py model.distance_space=symlog model.dynamic_trunc.advantage.mode=positive_only
+python3 train.py model.distance_space=symlog model.dynamic_trunc.advantage.mode=signed \
+  model.dynamic_trunc.advantage.max_factor=2.0
+```
+
+The launcher exposes `adv_mode`, `adv_max_factor`, `adv_scale_quantile`,
+`adv_scale_ema`, and `adv_scale_eps`, forwards them to every worker, and includes
+mode/factor in the method name, for example
+`VE_wasser_symlog_advpositive_only_x2.0_w50k_f64_H15`.
+
+When enabled, `train/imag_adv_full` logs normalized full advantage and
+`train/imag_trunc_score` logs adjusted uncertainty, each as a `[H,1]` curve.
+Existing uncertainty curves and `train/adv` retain their meanings; the latter
+still averages the training advantage over all positions, including masked ones.
+Additional `train/dynamic_trunc/` scalars are:
+
+- `adv_scale`: the lagged normalization scale actually used by the gate.
+- `raw_effective_horizon`: horizon from the original U-only mask at the same threshold.
+- `positive_adv_drop_fraction` / `negative_adv_drop_fraction`: removed full-advantage
+  mass divided by total mass of that sign, weighted by the detached imagination
+  weights. Nonfinite inputs are excluded; zero mass gives zero. During warmup,
+  both masks retain all positions and both drop fractions are zero.
+
+For ablations, compare `off`, `positive_only`, `signed`, and an unadjusted score
+with a threshold scale chosen to match average effective horizon. Inspect both
+evaluation returns and discarded positive-advantage mass. Historical comparison
+is restricted to `VE_wasser_symlog_f64_H15`, whose runs did not have the truncation
+warmup: use `model.dynamic_trunc.warmup_steps=0` for that comparison, or rerun all
+groups with the same 50k warmup. These settings do not launch experiments by themselves.
+
 `model.distance_space=raw` (default) uses the original return bins for `wasser`,
 `cramer`, and `sqrt_cramer`. Set it to `symlog` to integrate CDF differences with
 widths `symlog(bins).diff()` instead. The default critic's 255 bins are uniformly

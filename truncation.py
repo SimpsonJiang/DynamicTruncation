@@ -1,5 +1,7 @@
 """Value-ensemble uncertainty and first-crossing imagination truncation."""
 
+import math
+
 import torch
 from torch import nn
 
@@ -97,6 +99,83 @@ def _imag_cramer(value_dists, take_sqrt=False, *, space="raw"):
                 distance = distance.clamp_min(0.0).sqrt()
             total = total + distance
     return (total / (len(cdfs) * (len(cdfs) - 1) // 2)).to(dtype=torch.float32)
+
+
+class AdvantageScaleEMA(nn.Module):
+    """Normalize full-horizon advantages using a separate, lagged absolute quantile.
+
+    Nonfinite entries are excluded from the quantile. An entirely invalid batch
+    leaves both buffers unchanged; invalid normalized advantages remain invalid.
+    """
+
+    def __init__(self, quantile=0.9, decay=0.99, eps=1e-6):
+        super().__init__()
+        if not 0.0 <= quantile <= 1.0:
+            raise ValueError("dynamic_trunc.advantage.scale_quantile must be in [0, 1]")
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("dynamic_trunc.advantage.scale_ema must be in [0, 1)")
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError("dynamic_trunc.advantage.scale_eps must be finite and positive")
+        self.quantile = float(quantile)
+        self.decay = float(decay)
+        self.eps = float(eps)
+        self.register_buffer("value", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("initialized", torch.zeros((), dtype=torch.bool))
+
+    @torch.no_grad()
+    def forward(self, advantage):
+        advantage = advantage.detach().float()
+        finite = torch.isfinite(advantage)
+        raw = torch.nanquantile(torch.where(finite, advantage.abs(), torch.nan).flatten(), self.quantile)
+        valid = torch.isfinite(raw)
+        safe_raw = torch.where(valid, raw, torch.zeros_like(raw))
+        previous = self.value.clone()
+        scale = torch.where(self.initialized, previous, safe_raw).clamp_min(self.eps)
+        updated = torch.where(self.initialized, self.decay * previous + (1 - self.decay) * safe_raw, safe_raw)
+        self.value.copy_(torch.where(valid, updated, previous))
+        self.initialized.logical_or_(valid)
+        return advantage / scale, scale
+
+
+@torch.no_grad()
+def advantage_truncation_score(uncertainty, advantage, *, mode="positive_only", max_factor=2.0):
+    """Rescale nonnegative uncertainty by bounded, dimensionless advantage.
+
+    Both inputs have shape (B*T, H, 1). off/max_factor=1 are exact identity
+    paths, including when advantage is invalid. Otherwise invalid inputs cross
+    the threshold; build_truncation_mask still enforces its minimum prefix.
+    """
+    if mode not in ("off", "positive_only", "signed"):
+        raise ValueError("dynamic_trunc.advantage.mode must be 'off', 'positive_only' or 'signed'")
+    if not math.isfinite(max_factor) or max_factor < 1:
+        raise ValueError("dynamic_trunc.advantage.max_factor must be finite and >= 1")
+    uncertainty = uncertainty.detach().float()
+    if mode == "off" or max_factor == 1:
+        return uncertainty
+    advantage = advantage.detach().float()
+    valid = torch.isfinite(uncertainty) & (uncertainty >= 0) & torch.isfinite(advantage)
+    shaped = advantage.clamp_min(0) if mode == "positive_only" else advantage
+    score = uncertainty / (max_factor ** shaped.tanh())
+    return torch.where(valid, score, torch.full_like(score, torch.inf))
+
+
+@torch.no_grad()
+def advantage_drop_fractions(advantage, weight, mask):
+    """Fractions of weighted positive/negative full advantage removed by mask.
+
+    Ignore nonfinite inputs for diagnostics, and return zero for zero mass.
+    """
+    advantage, weight = advantage.detach().float(), weight.detach().float()
+    valid = torch.isfinite(advantage) & torch.isfinite(weight)
+    advantage = torch.where(valid, advantage, torch.zeros_like(advantage))
+    weight = torch.where(valid, weight.clamp_min(0), torch.zeros_like(weight))
+    fractions = []
+    for mass in (advantage.clamp_min(0), (-advantage).clamp_min(0)):
+        mass = mass * weight
+        total = mass.sum()
+        dropped = torch.where(mask, torch.zeros_like(mass), mass).sum()
+        fractions.append(dropped / torch.where(total > 0, total, torch.ones_like(total)))
+    return fractions[0], fractions[1]
 
 
 class ThresholdEMA(nn.Module):

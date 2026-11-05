@@ -16,7 +16,7 @@ from tensordict import TensorDict
 import truncation
 from distributions import TwoHot, symexp_twohot
 from dreamer import Dreamer
-from networks import MLPHead
+from networks import MLPHead, ReturnEMA
 from truncation import cal_ens_uncertainty
 
 SCORE_METHODS = {
@@ -67,6 +67,7 @@ class ValueEnsembleTest(unittest.TestCase):
         imag_horizon=3,
         distance_space="raw",
         warmup_steps=0,
+        advantage=None,
     ):
         config = OmegaConf.create(self.config)
         config.value_ensemble_size = size
@@ -78,6 +79,8 @@ class ValueEnsembleTest(unittest.TestCase):
         config.dynamic_trunc.enabled = trunc_enabled
         config.dynamic_trunc.min_horizon = min_horizon
         config.dynamic_trunc.warmup_steps = warmup_steps
+        if advantage is not None:
+            config.dynamic_trunc.advantage = advantage
         with contextlib.redirect_stdout(io.StringIO()):
             agent = Dreamer(config, self.obs_space, self.act_space).to("cpu")
         # CPU unit tests must not depend on whether this host exposes CUDA.
@@ -751,6 +754,194 @@ class ValueEnsembleTest(unittest.TestCase):
             metrics = agent.update(replay, env_step=2_000_000)
         self.assertFalse(cal_grad.call_args.kwargs["truncation_active"])
         self.assertFalse(any(key.startswith("dynamic_trunc/") for key in metrics))
+
+    def test_advantage_off_legacy_config_and_checkpoint_compatibility(self):
+        self.assertEqual(self.config["dynamic_trunc"]["advantage"]["mode"], "off")
+        agent = self.make_agent(trunc_enabled=True)
+        legacy_config = OmegaConf.to_container(OmegaConf.create(self.config))
+        del legacy_config["dynamic_trunc"]["advantage"]
+        with mock.patch.object(self, "config", legacy_config):
+            legacy = self.make_agent(trunc_enabled=True)
+        self.assertIsNone(agent.adv_scale)
+        self.assertIsNone(legacy.adv_scale)
+        self.assertFalse(any(k.startswith("adv_scale.") for k in agent.state_dict()))
+        legacy.load_state_dict(agent.state_dict(), strict=True)
+        data, initial = self.make_batch(agent)
+        with mock.patch.object(agent, "_lambda_return", wraps=agent._lambda_return) as returns:
+            _, metrics = agent._cal_grad(data, initial)
+        self.assertEqual(returns.call_count, 2)  # Only imagination and replay; no full-horizon gate return.
+        self.assertNotIn("imag_adv_full", metrics)
+        self.assertNotIn("imag_trunc_score", metrics)
+        # Disabling truncation also disables gate state/work even if a mode is configured.
+        disabled = self.make_agent(trunc_enabled=False, advantage={"mode": "signed"})
+        self.assertIsNone(disabled.adv_scale)
+
+    def test_advantage_factor_one_preserves_returns_losses_gradients_and_rng(self):
+        for mode in ("positive_only", "signed"):
+            for warmup in (0, 50_000):
+                with self.subTest(mode=mode, warmup=warmup):
+                    baseline = self.make_agent(trunc_enabled=True, min_horizon=1, warmup_steps=warmup, outscale=0.1)
+                    agent = self.make_agent(
+                        trunc_enabled=True,
+                        min_horizon=1,
+                        warmup_steps=warmup,
+                        outscale=0.1,
+                        advantage={"mode": mode, "max_factor": 1.0},
+                    )
+                    missing, unexpected = agent.load_state_dict(baseline.state_dict(), strict=False)
+                    self.assertEqual(set(missing), {"adv_scale.value", "adv_scale.initialized"})
+                    self.assertEqual(unexpected, [])
+                    data, initial = self.make_batch(baseline)
+                    scores = torch.tensor([1.0, 10.0, 10.0]).reshape(1, 3, 1).expand(8, -1, -1)
+                    rng = torch.get_rng_state()
+                    with (
+                        mock.patch("dreamer.cal_ens_uncertainty", return_value=scores),
+                        mock.patch.object(baseline, "_value_loss", wraps=baseline._value_loss) as base_loss,
+                    ):
+                        _, reference = baseline._cal_grad(data, initial)
+                    expected_rng = torch.get_rng_state()
+                    torch.set_rng_state(rng)
+                    with (
+                        mock.patch("dreamer.cal_ens_uncertainty", return_value=scores),
+                        mock.patch.object(agent, "_value_loss", wraps=agent._value_loss) as value_loss,
+                        mock.patch.object(ReturnEMA, "__call__", autospec=True, side_effect=ReturnEMA.__call__) as ema,
+                    ):
+                        _, metrics = agent._cal_grad(data, initial)
+                    ema.assert_called_once()
+                    torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+                    for key, expected in reference.items():
+                        torch.testing.assert_close(metrics[key], expected, rtol=0, atol=0)
+                    for i in (1, 4):  # Return targets and loss mask.
+                        torch.testing.assert_close(
+                            torch.as_tensor(value_loss.call_args_list[0].args[i]),
+                            torch.as_tensor(base_loss.call_args_list[0].args[i]),
+                            rtol=0,
+                            atol=0,
+                        )
+                    torch.testing.assert_close(agent.return_ema.ema_vals, baseline.return_ema.ema_vals, rtol=0, atol=0)
+                    for name, param in agent._named_params.items():
+                        other = baseline._named_params[name]
+                        if param.grad is None:
+                            self.assertIsNone(other.grad)
+                        else:
+                            torch.testing.assert_close(param.grad, other.grad, rtol=0, atol=0)
+
+    def test_full_advantage_controls_mask_without_changing_threshold_or_actor_advantage_formula(self):
+        for metric in ("wasser", "cramer", "sqrt_cramer", "sigma"):
+            for mode in ("positive_only", "signed"):
+                with self.subTest(metric=metric, mode=mode):
+                    agent = self.make_agent(
+                        trunc_enabled=True,
+                        min_horizon=1,
+                        metric=metric,
+                        distance_space="symlog",
+                        advantage={"mode": mode},
+                    )
+                    data, initial = self.make_batch(agent)
+                    scores = torch.tensor([1.0, 1.4, 0.75]).reshape(1, 3, 1).expand(8, -1, -1)
+                    delta = torch.tensor([2.0, 2.0, -2.0]).reshape(1, 3, 1).expand_as(scores)
+                    original_return = agent._lambda_return
+                    calls = []
+
+                    def full_then_masked(*args):
+                        calls.append(args)
+                        if len(calls) == 1:
+                            return args[3][:, :-1] + delta
+                        return original_return(*args)
+
+                    with (
+                        mock.patch("dreamer.cal_ens_uncertainty", return_value=scores),
+                        mock.patch.object(agent, "_lambda_return", side_effect=full_then_masked),
+                        mock.patch.object(agent, "_imagine", wraps=agent._imagine) as imagine,
+                        mock.patch("dreamer.torch.randperm", wraps=torch.randperm) as pair,
+                        mock.patch.object(agent, "_value_loss", wraps=agent._value_loss) as value_loss,
+                        mock.patch.object(ReturnEMA, "__call__", autospec=True, side_effect=ReturnEMA.__call__) as ema,
+                    ):
+                        _, metrics = agent._cal_grad(data, initial)
+                    self.assertEqual(len(calls), 3)  # Full gate return, masked training return, replay return.
+                    imagine.assert_called_once()
+                    pair.assert_called_once()
+                    ema.assert_called_once()
+                    self.assertEqual(calls[0][0].count_nonzero().item(), 0)
+                    self.assertIs(calls[0][3], calls[1][3])  # Same randomly selected value pair.
+                    expected_mask = torch.ones_like(scores, dtype=torch.bool)
+                    if mode == "signed":
+                        expected_mask[:, -1] = False
+                    torch.testing.assert_close(calls[1][0], truncation.mask_to_last(expected_mask))
+                    torch.testing.assert_close(metrics["dynamic_trunc/threshold_raw"], torch.tensor(1.0))
+                    torch.testing.assert_close(metrics["dynamic_trunc/threshold"], torch.tensor(1.0))
+                    torch.testing.assert_close(metrics[f"imag_{metric}"], scores.mean(dim=0))
+                    torch.testing.assert_close(metrics["imag_adv_full"], (delta / 2).mean(dim=0))
+                    expected_score = truncation.advantage_truncation_score(scores, delta / 2, mode=mode)
+                    torch.testing.assert_close(metrics["imag_trunc_score"], expected_score.mean(dim=0))
+                    self.assertEqual(metrics["dynamic_trunc/raw_effective_horizon"].item(), 1)
+                    self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 2 if mode == "signed" else 3)
+                    self.assertEqual(metrics["dynamic_trunc/positive_adv_drop_fraction"].item(), 0)
+                    self.assertEqual(
+                        metrics["dynamic_trunc/negative_adv_drop_fraction"].item(), float(mode == "signed")
+                    )
+                    masked_ret = value_loss.call_args_list[0].args[1][:, :-1]
+                    scale = (agent.return_ema.ema_vals[1] - agent.return_ema.ema_vals[0]).clamp_min(1)
+                    expected_adv = (masked_ret - calls[1][3][:, :-1]) / scale
+                    torch.testing.assert_close(metrics["adv"], expected_adv.mean())
+                    self.assertFalse(metrics["imag_adv_full"].requires_grad)
+                    self.assertFalse(metrics["imag_trunc_score"].requires_grad)
+
+    def test_advantage_scale_updates_during_warmup_and_survives_checkpoint(self):
+        agent = self.make_agent(
+            trunc_enabled=True,
+            min_horizon=1,
+            warmup_steps=50_000,
+            advantage={"mode": "signed"},
+            outscale=0.1,
+        )
+        data, initial = self.make_batch(agent)
+        replay = mock.Mock()
+        replay.sample.side_effect = lambda: (data.clone(), "indices", initial)
+        scores = torch.tensor([1.0, 10.0, 10.0]).reshape(1, 3, 1).expand(8, -1, -1)
+        for step in (49_999, 49_999, 50_000):
+            previous = agent.adv_scale.value.clone()
+            initialized = bool(agent.adv_scale.initialized)
+            with (
+                mock.patch("dreamer.cal_ens_uncertainty", return_value=scores),
+                mock.patch.object(agent.adv_scale, "forward", wraps=agent.adv_scale.forward) as scaling,
+                mock.patch.object(agent, "_lambda_return", wraps=agent._lambda_return) as returns,
+            ):
+                metrics = agent.update(replay, env_step=step)
+            scaling.assert_called_once()
+            raw = torch.quantile(scaling.call_args.args[0].abs().flatten(), 0.9)
+            expected = previous * 0.99 + raw * 0.01 if initialized else raw
+            torch.testing.assert_close(agent.adv_scale.value, expected)
+            self.assertTrue(agent.adv_scale.initialized)
+            self.assertEqual(returns.call_count, 2 if step < 50_000 else 3)
+            self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 3 if step < 50_000 else 1)
+            if step < 50_000:
+                self.assertEqual(metrics["dynamic_trunc/raw_effective_horizon"].item(), 3)
+                self.assertEqual(metrics["dynamic_trunc/positive_adv_drop_fraction"].item(), 0)
+                self.assertEqual(metrics["dynamic_trunc/negative_adv_drop_fraction"].item(), 0)
+        checkpoint = io.BytesIO()
+        torch.save(agent.state_dict(), checkpoint)
+        checkpoint.seek(0)
+        restored = self.make_agent(trunc_enabled=True, advantage={"mode": "signed"})
+        restored.load_state_dict(torch.load(checkpoint, weights_only=True), strict=True)
+        for key, value in agent.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[key], value)
+        for actual, expected in zip(restored.adv_scale(torch.ones(4)), agent.adv_scale(torch.ones(4))):
+            torch.testing.assert_close(actual, expected)
+
+    def test_advantage_configuration_rejects_ucb_and_invalid_settings(self):
+        for mode in ("positive_only", "signed"):
+            with self.assertRaisesRegex(ValueError, "ucb"):
+                self.make_agent(trunc_enabled=True, metric="ucb", advantage={"mode": mode})
+        for settings in (
+            {"mode": "unknown"},
+            {"mode": "signed", "max_factor": 0.9},
+            {"mode": "signed", "scale_quantile": 1.1},
+            {"mode": "signed", "scale_ema": 1},
+            {"mode": "signed", "scale_eps": 0},
+        ):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                self.make_agent(trunc_enabled=True, advantage=settings)
 
     def test_dynamic_threshold_curve_masks_and_return_normalization(self):
         for metric in SCORE_METHODS:

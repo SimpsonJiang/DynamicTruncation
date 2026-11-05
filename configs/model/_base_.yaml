@@ -29,6 +29,12 @@ dynamic_trunc:
   threshold_scale: 1.0
   threshold_ema: 0.999
   min_horizon: 8
+  advantage:
+    mode: "off" # off / positive_only / signed
+    max_factor: 2.0 # >= 1; beta = ln(max_factor)
+    scale_quantile: 0.9
+    scale_ema: 0.99
+    scale_eps: 1.0e-6
 
 loss_scales:
   barlow: 0.05

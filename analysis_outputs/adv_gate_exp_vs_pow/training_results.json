@@ -1,0 +1,30 @@
+[
+  {
+    "mode": "positive_only",
+    "shape": [
+      8,
+      15,
+      1
+    ],
+    "score_max_abs_diff": 3.725290298461914e-09,
+    "loss_max_abs_diff": 0.0,
+    "gradient_max_abs_diff": 0.0,
+    "mask_equal": true,
+    "return_equal": true,
+    "rng_equal": true
+  },
+  {
+    "mode": "signed",
+    "shape": [
+      8,
+      15,
+      1
+    ],
+    "score_max_abs_diff": 7.450580596923828e-09,
+    "loss_max_abs_diff": 0.0,
+    "gradient_max_abs_diff": 0.0,
+    "mask_equal": true,
+    "return_equal": true,
+    "rng_equal": true
+  }
+]

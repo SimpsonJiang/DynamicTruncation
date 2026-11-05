@@ -1,0 +1,176 @@
+{
+  "production_formula": "uncertainty / (max_factor ** shaped.tanh())",
+  "numerical_cases": 1843200,
+  "tested_factors": [
+    1.0,
+    1.01,
+    1.5,
+    2.0,
+    4.0,
+    10.0
+  ],
+  "max_relative_difference": 2.9337757069328246e-07,
+  "factor_2_max_relative_difference": 1.973104983953066e-07,
+  "sampled_mask_differences": 0,
+  "constructed_boundary_case": {
+    "mode": "positive_only",
+    "factor": 2.0,
+    "u": 7.072382857131743e-08,
+    "a": 1.0606640577316284,
+    "threshold": 4.101860540117741e-08,
+    "exp_score": 4.101860540117741e-08,
+    "pow_score": 4.101860895389109e-08,
+    "exp_kept": 15,
+    "pow_kept": 8,
+    "note": "Constructed threshold at the smaller rounded score; not sampled from an experiment."
+  },
+  "representative_cpu_timings": [
+    {
+      "mode": "positive_only",
+      "backend": "eager",
+      "shape": [
+        1024,
+        15,
+        1
+      ],
+      "factor": 2.0,
+      "exp_median_us": 358.59900526702404,
+      "pow_median_us": 423.23750676587224,
+      "exp_runs_us": [
+        359.28559955209494,
+        358.5529047995806,
+        362.20529582351446,
+        358.25681407004595,
+        358.59900526702404
+      ],
+      "pow_runs_us": [
+        421.9272523187101,
+        417.17919521033764,
+        428.04511031135917,
+        423.23750676587224,
+        430.0472908653319
+      ],
+      "output_max_abs_diff": 1.1920928955078125e-07,
+      "pow_over_exp": 1.1802528745184788
+    },
+    {
+      "mode": "positive_only",
+      "backend": "inductor",
+      "shape": [
+        1024,
+        15,
+        1
+      ],
+      "factor": 2.0,
+      "exp_median_us": 120.19375571981072,
+      "pow_median_us": 124.89600339904428,
+      "exp_runs_us": [
+        137.3695908114314,
+        119.4122014567256,
+        120.19375571981072,
+        127.80330143868923,
+        115.29200710356236
+      ],
+      "pow_runs_us": [
+        124.89600339904428,
+        118.42940002679825,
+        290.3947001323104,
+        138.85318767279387,
+        106.44186986610293
+      ],
+      "output_max_abs_diff": 1.1920928955078125e-07,
+      "pow_over_exp": 1.0391222293626898
+    },
+    {
+      "mode": "signed",
+      "backend": "eager",
+      "shape": [
+        1024,
+        15,
+        1
+      ],
+      "factor": 2.0,
+      "exp_median_us": 277.9280999675393,
+      "pow_median_us": 343.1439050473273,
+      "exp_runs_us": [
+        320.9454123862087,
+        301.0449931025505,
+        271.14665135741234,
+        271.73259295523167,
+        277.9280999675393
+      ],
+      "pow_runs_us": [
+        357.6549468562007,
+        343.1439050473273,
+        321.689760312438,
+        325.45459689572453,
+        421.57075367867947
+      ],
+      "output_max_abs_diff": 2.384185791015625e-07,
+      "pow_over_exp": 1.234649915166566
+    },
+    {
+      "mode": "signed",
+      "backend": "inductor",
+      "shape": [
+        1024,
+        15,
+        1
+      ],
+      "factor": 2.0,
+      "exp_median_us": 131.2804059125483,
+      "pow_median_us": 128.13444482162595,
+      "exp_runs_us": [
+        211.23493555933237,
+        132.88380578160286,
+        131.18870556354523,
+        129.51809912919998,
+        131.2804059125483
+      ],
+      "pow_runs_us": [
+        128.99870052933693,
+        128.13444482162595,
+        127.12559546343982,
+        126.54896476306023,
+        289.73569511435926
+      ],
+      "output_max_abs_diff": 2.384185791015625e-07,
+      "pow_over_exp": 0.9760363241638815
+    }
+  ],
+  "toy_gradient_checks": [
+    {
+      "mode": "positive_only",
+      "shape": [
+        8,
+        15,
+        1
+      ],
+      "score_max_abs_diff": 3.725290298461914e-09,
+      "loss_max_abs_diff": 0.0,
+      "gradient_max_abs_diff": 0.0,
+      "mask_equal": true,
+      "return_equal": true,
+      "rng_equal": true
+    },
+    {
+      "mode": "signed",
+      "shape": [
+        8,
+        15,
+        1
+      ],
+      "score_max_abs_diff": 7.450580596923828e-09,
+      "loss_max_abs_diff": 0.0,
+      "gradient_max_abs_diff": 0.0,
+      "mask_equal": true,
+      "return_equal": true,
+      "rng_equal": true
+    }
+  ],
+  "limitations": [
+    "CPU only; CUDA initialization unavailable.",
+    "Timing measures gate evaluation only, not end-to-end training.",
+    "Values are not bitwise equal; a constructed threshold at rounding differences changes the mask."
+  ]
+}

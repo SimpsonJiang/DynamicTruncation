@@ -15,7 +15,16 @@ import tools
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
-from truncation import ThresholdEMA, build_truncation_mask, cal_ens_uncertainty, mask_to_last, normalized_mask
+from truncation import (
+    AdvantageScaleEMA,
+    ThresholdEMA,
+    advantage_drop_fractions,
+    advantage_truncation_score,
+    build_truncation_mask,
+    cal_ens_uncertainty,
+    mask_to_last,
+    normalized_mask,
+)
 
 
 class Dreamer(nn.Module):
@@ -77,6 +86,23 @@ class Dreamer(nn.Module):
         if self.imag_horizon < 1:
             raise ValueError("imag_horizon must be at least 1")
         self.trunc_kappa = ThresholdEMA(float(trunc.get("threshold_ema", 0.999))) if self.dynamic_trunc_enabled else None
+
+        adv_trunc = trunc.get("advantage", {})
+        self.adv_trunc_mode = str(adv_trunc.get("mode", "off"))
+        self.adv_trunc_max_factor = float(adv_trunc.get("max_factor", 2.0))
+        if self.adv_trunc_mode not in ("off", "positive_only", "signed"):
+            raise ValueError("dynamic_trunc.advantage.mode must be 'off', 'positive_only' or 'signed'")
+        if not math.isfinite(self.adv_trunc_max_factor) or self.adv_trunc_max_factor < 1:
+            raise ValueError("dynamic_trunc.advantage.max_factor must be finite and >= 1")
+        self.adv_scale = None
+        if self.dynamic_trunc_enabled and self.adv_trunc_mode != "off":
+            if self.uncer_metric == "ucb":
+                raise ValueError("Advantage truncation requires nonnegative uncertainty; ucb is not supported")
+            self.adv_scale = AdvantageScaleEMA(
+                quantile=float(adv_trunc.get("scale_quantile", 0.9)),
+                decay=float(adv_trunc.get("scale_ema", 0.99)),
+                eps=float(adv_trunc.get("scale_eps", 1e-6)),
+            )
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -524,12 +550,26 @@ class Dreamer(nn.Module):
         weight = torch.cumprod(imag_cont * disc, dim=1)
         loss_mask = 1.0
         last = torch.zeros_like(imag_cont)
+        term = 1 - imag_cont
+        full_ret = None
+        trunc_score = imag_uncertainty
+        if self.adv_scale is not None:
+            # Full-horizon gate advantage is independent of the current truncation mask.
+            full_ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
+            full_adv = (full_ret - imag_value[:, :-1]).detach().float()
+            gate_adv, adv_scale = self.adv_scale(full_adv)
+            trunc_score = advantage_truncation_score(
+                imag_uncertainty, gate_adv, mode=self.adv_trunc_mode, max_factor=self.adv_trunc_max_factor
+            )
+            metrics["imag_adv_full"] = gate_adv.mean(dim=0)
+            metrics["imag_trunc_score"] = trunc_score.mean(dim=0)
+            metrics["dynamic_trunc/adv_scale"] = adv_scale
         if self.dynamic_trunc_enabled:
             raw_threshold = torch.quantile(imag_uncertainty[:, 0].reshape(-1), self.dynamic_trunc_quantile)
             raw_threshold = raw_threshold * self.dynamic_trunc_threshold_scale
             threshold = self.trunc_kappa(raw_threshold)
             if truncation_active:
-                trunc_mask = build_truncation_mask(imag_uncertainty, threshold, self.dynamic_trunc_min_horizon)
+                trunc_mask = build_truncation_mask(trunc_score, threshold, self.dynamic_trunc_min_horizon)
                 loss_mask = normalized_mask(trunc_mask)
                 last = mask_to_last(trunc_mask)
                 keep_rate = trunc_mask.float().mean()
@@ -542,9 +582,22 @@ class Dreamer(nn.Module):
             metrics["dynamic_trunc/threshold"] = threshold
             metrics["dynamic_trunc/keep_rate"] = keep_rate
             metrics["dynamic_trunc/effective_horizon"] = effective_horizon
-        term = 1 - imag_cont
-        ret = self._lambda_return(
-            last, term, imag_reward, imag_value, imag_value, disc, self.lamb
+            if self.adv_scale is not None:
+                actual_mask = trunc_mask if truncation_active else torch.ones_like(trunc_score, dtype=torch.bool)
+                raw_mask = (
+                    build_truncation_mask(imag_uncertainty, threshold, self.dynamic_trunc_min_horizon)
+                    if truncation_active
+                    else actual_mask
+                )
+                positive_drop, negative_drop = advantage_drop_fractions(full_adv, weight[:, :-1], actual_mask)
+                metrics["dynamic_trunc/raw_effective_horizon"] = raw_mask.float().sum(dim=1).mean()
+                metrics["dynamic_trunc/positive_adv_drop_fraction"] = positive_drop
+                metrics["dynamic_trunc/negative_adv_drop_fraction"] = negative_drop
+        # Reuse full returns during warmup; actor/value targets otherwise retain the original masked recursion.
+        ret = (
+            full_ret
+            if full_ret is not None and not truncation_active
+            else self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
         )  # (B*T, T_imag-1, 1)
         ret_for_stats = torch.where(trunc_mask, ret, imag_value[:, :-1]) if truncation_active else ret
         ret_offset, ret_scale = self.return_ema(ret_for_stats)
