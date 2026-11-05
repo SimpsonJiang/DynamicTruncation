@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from distributions import symlog
+from distributions import Quantile, TwoHot, symlog
 
 
 @torch.no_grad()
@@ -18,6 +18,8 @@ def cal_ens_uncertainty(imag_value_dist, imag_value, metric, *, beta=0.1, distan
     Only inputs needed by the selected metric are evaluated. beta affects UCB only.
     distance_space selects raw or symlog bins for W1 and both Cramer scores.
     """
+    if metric != "wasser" and imag_value_dist is not None and any(isinstance(d, Quantile) for d in imag_value_dist):
+        raise ValueError("Quantile ensembles support only the wasser uncertainty metric")
     if metric == "wasser":
         return _imag_wasserstein(imag_value_dist, space=distance_space)
     if metric in ("cramer", "sqrt_cramer"):
@@ -61,6 +63,12 @@ def _distance_bin_widths(value_dist, space):
 @torch.no_grad()
 def _imag_wasserstein(value_dists, *, space="raw"):
     """Mean pairwise W1 on raw or symlog bins; float64 math, float32 output."""
+    if any(isinstance(dist, Quantile) for dist in value_dists):
+        categorical = [dist for dist in value_dists if isinstance(dist, TwoHot)]
+        quantile = [dist for dist in value_dists if isinstance(dist, Quantile)]
+        if len(value_dists) != 2 or len(categorical) != 1 or len(quantile) != 1:
+            raise ValueError("Mixed W1 requires exactly one TwoHot and one Quantile distribution")
+        return _categorical_quantile_wasserstein(categorical[0], quantile[0], space=space)
     widths = _distance_bin_widths(value_dists[0], space)
     if len(value_dists) == 1:
         return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
@@ -75,6 +83,48 @@ def _imag_wasserstein(value_dists, *, space="raw"):
         for j in range(i + 1, len(cdfs)):
             total = total + ((cdfs[i] - cdfs[j]).abs() * widths).sum(dim=-1, keepdim=True)
     return (total / (len(cdfs) * (len(cdfs) - 1) // 2)).to(dtype=torch.float32)
+
+
+@torch.no_grad()
+def _categorical_quantile_wasserstein(categorical, quantile, *, space="raw"):
+    """Exact CDF integration on the union of supports, with bounded working memory.
+
+    At most 2048 trajectory/time rows are sorted together. No C-by-Q tensor is
+    constructed. Training quantile order is untouched; this path is detached.
+    """
+    if space not in ("raw", "symlog"):
+        raise ValueError("model.distance_space must be 'raw' or 'symlog'")
+    if categorical.logits.shape[:-1] != quantile.quantiles.shape[:-1]:
+        raise ValueError("Categorical and quantile batch shapes must match")
+    logits = categorical.logits.detach()[:, :-1]
+    atoms = quantile.quantiles.detach()[:, :-1]
+    batch_shape = logits.shape[:-1]
+    bins = categorical.bins.detach().to(torch.float64)
+    if space == "symlog":
+        bins = symlog(bins)
+    logits = logits.reshape(-1, logits.shape[-1])
+    atoms = atoms.reshape(-1, atoms.shape[-1])
+    pieces = []
+    for cat_logits, quantiles in zip(logits.split(2048), atoms.split(2048)):
+        probs = cat_logits.to(torch.float64).softmax(dim=-1)
+        quantiles = quantiles.to(torch.float64)
+        if space == "symlog":
+            quantiles = symlog(quantiles)
+        quantiles = quantiles.sort(dim=-1).values.contiguous()
+        support = torch.cat([bins.expand(probs.shape[0], -1), quantiles], dim=-1).sort(dim=-1).values
+        left = support[:, :-1].contiguous()
+        widths = support.diff(dim=-1)
+        zero = torch.zeros_like(probs[:, :1])
+        prefix = torch.cat([zero, probs.cumsum(dim=-1)], dim=-1)
+        survival = torch.cat([probs.flip(-1).cumsum(-1).flip(-1), zero], dim=-1)
+        # Sum from the closer endpoint: exactly empty far tails stay exactly empty.
+        cdf = torch.where(prefix <= 0.5, prefix, 1.0 - survival)
+        cat_index = torch.searchsorted(bins, left, right=True)
+        cat_cdf = cdf.gather(-1, cat_index)
+        quantile_cdf = torch.searchsorted(quantiles, left, right=True).to(torch.float64) / quantiles.shape[-1]
+        distance = ((cat_cdf - quantile_cdf).abs() * widths).sum(dim=-1, keepdim=True)
+        pieces.append(distance.to(torch.float32))
+    return torch.cat(pieces, dim=0).reshape(*batch_shape, 1)
 
 
 @torch.no_grad()

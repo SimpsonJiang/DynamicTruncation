@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import distributions as torchd
 from torch.nn import functional as F
@@ -129,6 +131,51 @@ class TwoHot:
         return (mixed_target * log_pred).sum(dim=-1)  # (...)
 
 
+class Quantile:
+    """Equal-mass atoms at fixed midpoint quantile levels, in raw return units.
+
+    Quantiles have shape (..., Q). Training preserves their level ordering;
+    distribution distances may sort atom locations without changing their law.
+    Like TwoHot, mode() returns the expectation, not a statistical mode.
+    """
+
+    def __init__(self, quantiles, huber_kappa=1.0):
+        if quantiles.ndim < 1 or quantiles.shape[-1] < 1:
+            raise ValueError("Quantile requires at least one atom in the last dimension")
+        self.huber_kappa = float(huber_kappa)
+        if not math.isfinite(self.huber_kappa) or self.huber_kappa <= 0:
+            raise ValueError("quantile.huber_kappa must be finite and positive")
+        self.quantiles = to_f32(quantiles)
+        self.num_quantiles = self.quantiles.shape[-1]
+
+    @property
+    def probs(self):
+        return torch.full_like(self.quantiles, 1.0 / self.num_quantiles)
+
+    def mode(self):
+        return self.quantiles.mean(dim=-1, keepdim=True)  # (..., 1)
+
+    def mean(self):
+        return self.mode()
+
+    def quantile_huber_loss(self, target):
+        """Mean over predicted quantiles for one detached scalar target (..., 1)."""
+        if target.shape != self.quantiles.shape[:-1] + (1,):
+            raise ValueError("Quantile target must have shape (..., 1) matching the prediction batch")
+        delta = to_f32(target.detach()) - self.quantiles
+        absolute = delta.abs()
+        quadratic = absolute.clamp(max=self.huber_kappa)
+        # Huber(delta) / kappa, without squaring the potentially huge residual.
+        huber = 0.5 * quadratic * (quadratic / self.huber_kappa) + (absolute - quadratic)
+        tau = (torch.arange(self.num_quantiles, device=delta.device, dtype=delta.dtype) + 0.5) / self.num_quantiles
+        weight = (tau - (delta < 0).to(delta.dtype)).abs()
+        return (weight * huber).mean(dim=-1)  # (...)
+
+    def log_prob(self, target):
+        """Negative Quantile-Huber training loss; NOT a normalized log density."""
+        return -self.quantile_huber_loss(target)
+
+
 class MSEDist:
     def __init__(self, mode, agg="sum"):
         # (..., D)
@@ -249,6 +296,10 @@ def symexp_twohot(logits, bin_num, **kwargs):
         half = symexp(half)
         bins = torch.concatenate([half, -half.flip(dims=(0,))], 0)
     return TwoHot(to_f32(logits), bins)
+
+
+def quantile(quantiles, huber_kappa=1.0, **kwargs):
+    return Quantile(quantiles, huber_kappa=huber_kappa)
 
 
 def symlog_mse(logits, **kwargs):

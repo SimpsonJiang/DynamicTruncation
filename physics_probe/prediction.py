@@ -64,7 +64,7 @@ def prediction_check(dataset, checkpoint, output, device, batch_size=256):
         shard = load_shard(path, meta["episodes"][episode])
         if shard["cores"].dtype != torch.float64:
             raise ValueError("Prediction evaluation requires original float64 targets")
-        x = shard[saved["source"]].to(dtype=model.dtype)
+        x = shard[saved["source"]].to(dtype=torch.uint8 if saved["source"] == "images" else model.dtype)
         y = shard["cores"]
         chunks, total = [], 0.0
         for a, b in zip(x.split(batch_size), y.split(batch_size)):
@@ -74,13 +74,15 @@ def prediction_check(dataset, checkpoint, output, device, batch_size=256):
         prediction = torch.cat(chunks).numpy()
         target = y.numpy()
         vectors = metric_vectors(prediction, target, meta["schema"])
-        episodes.append({
-            "episode_id": episode,
-            "episode_seed": shard["episode_seed"],
-            "samples": len(x),
-            "loss": total / len(x),
-            "metrics": summarize_vectors(vectors),
-        })
+        episodes.append(
+            {
+                "episode_id": episode,
+                "episode_seed": shard["episode_seed"],
+                "samples": len(x),
+                "loss": total / len(x),
+                "metrics": summarize_vectors(vectors),
+            }
+        )
         predictions.append(prediction)
         targets.append(target)
         weighted_loss += total

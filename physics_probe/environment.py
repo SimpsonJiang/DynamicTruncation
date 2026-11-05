@@ -17,14 +17,14 @@ def tensor(array):
 
 
 class ProbeEnv:
-    """Match repository DMC action repeat/normalization/time limits without rendering.
+    """Match repository DMC action repeat/normalization/time limits, with optional RGB rendering.
 
     Restricted to four deterministic, fixed-model tasks. The model hash rejects
     cross-model restores instead of pretending integration state contains mjModel.
-    No image is rendered and no physics label is added to observation_space.
+    RGB rendering is opt-in. No physics label is added to observation_space.
     """
 
-    def __init__(self, config, seed):
+    def __init__(self, config, seed, include_image=False):
         self.task = str(config.task).removeprefix("dmc_")
         if self.task not in TASKS:
             raise ValueError(f"Unsupported probe task: {self.task}")
@@ -33,6 +33,9 @@ class ProbeEnv:
         if self.repeat < 1 or self.limit < 1:
             raise ValueError("action_repeat and time_limit must permit at least one step")
         self.seed = int(seed)
+        self.include_image = bool(include_image)
+        self.image_size = tuple(config.get("size", (64, 64)))
+        self.camera_id = 2 if self.task.startswith("quadruped_") else 0
         domain, task = self.task.split("_", 1)
         self.env = suite.load(domain, task, task_kwargs={"random": self.seed})
         self.physics = self.env.physics
@@ -41,15 +44,21 @@ class ProbeEnv:
         spec = self.env.action_spec()
         self.low, self.high = spec.minimum, spec.maximum
         self.action_space = gym.spaces.Box(-1.0, 1.0, spec.shape, dtype=np.float32)
-        self.observation_space = gym.spaces.Dict({
-            k: gym.spaces.Box(-np.inf, np.inf, v.shape or (1,), dtype=np.float32)
-            for k, v in self.env.observation_spec().items()
-        })
+        self.observation_space = gym.spaces.Dict(
+            {
+                k: gym.spaces.Box(-np.inf, np.inf, v.shape or (1,), dtype=np.float32)
+                for k, v in self.env.observation_spec().items()
+            }
+        )
+        if self.include_image:
+            self.observation_space.spaces["image"] = gym.spaces.Box(0, 255, self.image_size + (3,), dtype=np.uint8)
         self.reset()
 
     def observation(self, first=False, last=False, terminal=False):
         obs = {k: np.atleast_1d(v).astype(np.float32) for k, v in self.env.task.get_observation(self.physics).items()}
         obs.update(is_first=np.array([first]), is_last=np.array([last]), is_terminal=np.array([terminal]))
+        if self.include_image:
+            obs["image"] = self.physics.render(*self.image_size, camera_id=self.camera_id)
         return obs
 
     def reset(self):

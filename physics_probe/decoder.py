@@ -70,10 +70,13 @@ class StateDecoder(nn.Module):
     @torch.no_grad()
     def normalize_from_training(self, inputs, cores):
         inputs = inputs.to(self.input_mean)
-        cores = cores.to(self.target_mean)
-        target = self.codec.encode(cores)
         self.input_mean.copy_(inputs.mean(0))
         self.input_scale.copy_(inputs.std(0, unbiased=False).clamp_min(1e-3))
+        self.normalize_targets(cores)
+
+    @torch.no_grad()
+    def normalize_targets(self, cores):
+        target = self.codec.encode(cores.to(self.target_mean))
         self.target_mean.copy_(target.mean(0))
         std = target.std(0, unbiased=False)
         self.active.copy_(std > 1e-6)
@@ -147,6 +150,67 @@ class StateDecoder(nn.Module):
         name = str(dtype).removeprefix("torch.")
         if exported.get("dtype", name) != name:
             raise ValueError("Decoder dtype metadata disagrees with saved tensors")
-        model = cls(exported["input_dim"], exported["schema"], exported["hidden"], dtype=dtype).to(device)
+        architecture = exported.get("architecture", "mlp")
+        if architecture == "image_cnn":
+            model = ImageStateDecoder(exported["image_shape"], exported["schema"], exported["hidden"], dtype=dtype)
+        elif architecture == "mlp":
+            model = cls(exported["input_dim"], exported["schema"], exported["hidden"], dtype=dtype)
+        else:
+            raise ValueError(f"Unknown state decoder architecture: {architecture}")
+        model = model.to(device)
         model.load_state_dict(copy.deepcopy(exported["state_dict"]), strict=True)
         return model.eval()
+
+
+class ImageStateDecoder(StateDecoder):
+    """Single-frame RGB control: four strided convolutions and the same state loss.
+
+    Pixels stay uint8 in the dataset/host batches; only minibatches are promoted
+    to float64. Input scaling is fixed at pixel / 255 - 0.5, not fitted on test data.
+    This control has no temporal context and receives no privileged proprio input.
+    """
+
+    def __init__(self, image_shape, schema, hidden=256, dtype=torch.float64):
+        image_shape = tuple(image_shape)
+        if image_shape != (64, 64, 3):
+            raise ValueError("Image state decoder currently supports saved 64x64 RGB observations")
+        super().__init__(1, schema, hidden, dtype)
+        self.image_shape = image_shape
+        layers, channels = [], 3
+        for output_channels in (16, 32, 64, 128):
+            layers += [nn.Conv2d(channels, output_channels, 3, stride=2, padding=1, dtype=dtype), nn.SiLU()]
+            channels = output_channels
+        self.net = nn.Sequential(
+            *layers,
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, hidden, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(hidden, self.codec.dim, dtype=dtype),
+        )
+
+    @torch.no_grad()
+    def normalize_from_training(self, inputs, cores):
+        if tuple(inputs.shape[1:]) != self.image_shape or inputs.dtype != torch.uint8:
+            raise ValueError("Train image decoder from original uint8 NHWC pixels")
+        self.normalize_targets(cores)
+
+    def encoded_prediction(self, inputs):
+        if tuple(inputs.shape[1:]) != self.image_shape:
+            raise ValueError("Image state decoder expects [batch,64,64,3]")
+        pixels = (inputs.to(self.input_mean) / 255.0 - 0.5).permute(0, 3, 1, 2)
+        normalized = self.net(pixels) * self.active
+        return normalized * self.target_scale + self.target_mean
+
+    def export(self):
+        result = super().export()
+        result.update(
+            version=3,
+            architecture="image_cnn",
+            image_shape=list(self.image_shape),
+            channels=[16, 32, 64, 128],
+            pixel_normalization="uint8 / 255 - 0.5",
+            temporal_context=1,
+        )
+        return result

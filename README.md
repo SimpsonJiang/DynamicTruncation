@@ -33,13 +33,27 @@ Switching algorithms:
 python3 train.py model.rep_loss=r2dreamer
 ```
 
-The value ensemble defaults to 5 independent heads. For example:
+The value ensemble defaults to 5 independent categorical heads (`model.value_ensemble_type=categorical`). For example:
 
 ```bash
 python3 train.py model.rep_loss=dreamer model.value_ensemble_size=5
 ```
 
-Each update samples two heads whose mean predicts imagination bootstrap values and the
+An alternative uses exactly one categorical and one quantile critic:
+
+```bash
+python3 train.py model.rep_loss=dreamer model.value_ensemble_type=categorical_quantile model.uncer_metric=wasser
+```
+
+This mode averages the two distribution expectations for returns and advantages, uses
+two-hot CE / Quantile-Huber losses against the existing scalar lambda-return, and
+computes exact W1 between the different supports. `model.value_ensemble_size` controls
+only the categorical mode. `model.quantile.repval_grad=false` disables only the quantile
+repval gradient into the world model; the quantile critic continues learning. Defaults
+are 255 quantiles, Huber kappa 1.0, and `repval_grad=true`. See
+[value ensemble modes](docs/value_ensemble.md) for loss, gradient, distance-space and checkpoint details.
+
+In categorical mode, each update samples two heads whose mean predicts imagination bootstrap values and the
 advantage baseline. All heads train on the same return targets, with a separate slow
 target per head; their losses are averaged before backpropagation.
 

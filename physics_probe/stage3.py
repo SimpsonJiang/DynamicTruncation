@@ -172,19 +172,21 @@ def summarize(root, protocol):
         for source in protocol["sources"]:
             report = json.loads((root / entry / f"test_{source}.json").read_text())
             metrics = report["state_metrics"]
-            rows.append({
-                "entry": entry,
-                "source": source,
-                "dtype": report["decoder_dtype"],
-                "best_epoch": report["best_epoch"],
-                "validation_loss": report["best_validation_loss"],
-                "test_loss": report["test_loss"],
-                "test_samples": report["samples"],
-                **{
-                    key: metrics.get(key, {}).get("mean")
-                    for key in ("qpos_nonquat_wrapped_rmse", "qvel_rmse", "act_rmse", "orientation_radians")
-                },
-            })
+            rows.append(
+                {
+                    "entry": entry,
+                    "source": source,
+                    "dtype": report["decoder_dtype"],
+                    "best_epoch": report["best_epoch"],
+                    "validation_loss": report["best_validation_loss"],
+                    "test_loss": report["test_loss"],
+                    "test_samples": report["samples"],
+                    **{
+                        key: metrics.get(key, {}).get("mean")
+                        for key in ("qpos_nonquat_wrapped_rmse", "qvel_rmse", "act_rmse", "orientation_radians")
+                    },
+                }
+            )
     atomic_json(root / "summary.json", {"rows": rows, "scientific_acceptance": None})
     with (root / "summary.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
@@ -223,6 +225,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--observations", action="store_true")
+    parser.add_argument("--images", action="store_true", help="Train the single-frame image-to-state CNN control")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--gpu-memory-gib", type=float, default=2)
     parser.add_argument("--data-seed", type=int, default=50000)
@@ -235,7 +238,16 @@ def main():
     )
     parser.add_argument("--worker-entry")
     parser.add_argument(
-        "--worker-stage", choices=("collect", "fit_features", "test_features", "fit_observations", "test_observations")
+        "--worker-stage",
+        choices=(
+            "collect",
+            "fit_features",
+            "test_features",
+            "fit_observations",
+            "test_observations",
+            "fit_images",
+            "test_images",
+        ),
     )
     args = parser.parse_args()
     root = args.output.resolve()
@@ -251,11 +263,19 @@ def main():
             parser.error("Positive budgets and at least three episodes required")
         if not 0 < args.gpu_memory_gib <= 4 or not 0 < args.lr < 1:
             parser.error("Use a GPU cap up to 4 GiB and a positive learning rate below 1")
-        from .common import load_config, provenance, select_entry, validate_device
+        from .common import (
+            load_config,
+            observation_mode,
+            provenance,
+            select_entry,
+            validate_device,
+        )
         from .environment import TASKS
 
         validate_device(args.device)
         manifest = json.loads(args.manifest.read_text())
+        if args.images and (args.observations or manifest.get("modality") != "vision"):
+            parser.error("Select image control only for a vision campaign, separately from proprio control")
         entries = validate_manifest(manifest, args.expected_models)
         for entry in entries:
             selected = select_entry(args.manifest, entry["id"])
@@ -264,7 +284,7 @@ def main():
                 entry["task"] not in TASKS
                 or config.env.task != f"dmc_{entry['task']}"
                 or config.seed != entry["model_seed"]
-                or config.env.encoder.cnn_keys != "$^"
+                or observation_mode(config) != manifest.get("modality", "proprio")
             ):
                 raise ValueError(f"Saved environment does not match manifest: {entry['id']}")
         root.mkdir(parents=True, exist_ok=False)
@@ -274,7 +294,13 @@ def main():
             "entries": [e["id"] for e in manifest["entries"]],
             "model_count": len(entries),
             "checkpoint_group": manifest.get("group"),
-            "sources": ["features", "observations"] if args.observations else ["features"],
+            "modality": manifest.get("modality", "proprio"),
+            "observation_control": "single RGB image" if args.images else "proprio" if args.observations else None,
+            "sources": (
+                ["features", "images"]
+                if args.images
+                else ["features", "observations"] if args.observations else ["features"]
+            ),
             "episodes": args.episodes,
             "epochs": args.epochs,
             "max_steps": args.max_steps,

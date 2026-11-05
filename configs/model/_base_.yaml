@@ -15,7 +15,12 @@ eps: 1e-20
 beta1: 0.9
 beta2: 0.999
 warmup: 1000
-value_ensemble_size: 5
+value_ensemble_type: categorical # categorical / categorical_quantile
+value_ensemble_size: 5 # categorical only; categorical_quantile always has 2 members
+quantile:
+  num_quantiles: 255
+  huber_kappa: 1.0
+  repval_grad: true # quantile repval contributes gradients to the world model
 uncer_metric: wasser # wasser / ucb / sigma / cramer / sqrt_cramer
 distance_space: raw # raw / symlog; bin coordinates for wasser / cramer / sqrt_cramer
 beta: 0.1

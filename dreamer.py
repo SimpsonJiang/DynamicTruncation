@@ -4,6 +4,7 @@ from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
@@ -39,7 +40,11 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)  #计算return（batch内）5%和95%分位数的EMA，其差值就是S,Advantage的scale
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
-        self.value_ensemble_size = config.value_ensemble_size
+        self.value_ensemble_type = str(config.get("value_ensemble_type", "categorical"))
+        if self.value_ensemble_type not in ("categorical", "categorical_quantile"):
+            raise ValueError("model.value_ensemble_type must be 'categorical' or 'categorical_quantile'")
+        self.mixed_value_ensemble = self.value_ensemble_type == "categorical_quantile"
+        self.value_ensemble_size = 2 if self.mixed_value_ensemble else config.value_ensemble_size
         if (
             isinstance(self.value_ensemble_size, bool)
             or not isinstance(self.value_ensemble_size, int)
@@ -49,6 +54,29 @@ class Dreamer(nn.Module):
         self.uncer_metric = str(config.get("uncer_metric", "wasser"))
         if self.uncer_metric not in ("wasser", "ucb", "sigma", "cramer", "sqrt_cramer"):
             raise ValueError("model.uncer_metric must be 'wasser', 'ucb', 'sigma', 'cramer' or 'sqrt_cramer'")
+        self.quantile_repval_grad = True
+        if self.mixed_value_ensemble:
+            if self.uncer_metric != "wasser":
+                raise ValueError("categorical_quantile requires model.uncer_metric=wasser")
+            if str(config.critic.dist.name) != "symexp_twohot":
+                raise ValueError("categorical_quantile requires a symexp_twohot categorical critic")
+            quantile_config = config.get("quantile", {})
+            self.num_quantiles = quantile_config.get("num_quantiles", 255)
+            if (
+                isinstance(self.num_quantiles, bool)
+                or not isinstance(self.num_quantiles, int)
+                or self.num_quantiles < 1
+            ):
+                raise ValueError("model.quantile.num_quantiles must be a positive integer")
+            self.quantile_huber_kappa = float(quantile_config.get("huber_kappa", 1.0))
+            if not math.isfinite(self.quantile_huber_kappa) or self.quantile_huber_kappa <= 0:
+                raise ValueError("model.quantile.huber_kappa must be finite and positive")
+            self.quantile_repval_grad = quantile_config.get("repval_grad", True)
+            if not isinstance(self.quantile_repval_grad, bool):
+                raise ValueError("model.quantile.repval_grad must be a boolean")
+            # Legacy categorical checkpoints retain exactly their previous keys.
+            self.register_buffer("_categorical_quantile_marker", torch.tensor(1, dtype=torch.int8))
+        self.register_load_state_dict_pre_hook(self._check_value_ensemble_checkpoint)
         self.distance_space = str(config.get("distance_space", "raw"))
         if self.distance_space not in ("raw", "symlog"):
             raise ValueError("model.distance_space must be 'raw' or 'symlog'")
@@ -129,9 +157,22 @@ class Dreamer(nn.Module):
 
         # Actor-critic components
         self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value = nn.ModuleList(
-            [networks.MLPHead(config.critic, self.rssm.feat_size) for _ in range(self.value_ensemble_size)]
-        )
+        if self.mixed_value_ensemble:
+            # Resolve Hydra parent interpolations before making a standalone copy.
+            quantile_critic = OmegaConf.create(OmegaConf.to_container(config.critic, resolve=True))
+            quantile_critic.shape = [self.num_quantiles]
+            quantile_critic.dist = {"name": "quantile", "huber_kappa": self.quantile_huber_kappa}
+            self.value = nn.ModuleList(
+                [
+                    networks.MLPHead(config.critic, self.rssm.feat_size),
+                    networks.MLPHead(quantile_critic, self.rssm.feat_size),
+                ]
+            )
+            print("Value ensemble: categorical_quantile (2 members)")
+        else:
+            self.value = nn.ModuleList(
+                [networks.MLPHead(config.critic, self.rssm.feat_size) for _ in range(self.value_ensemble_size)]
+            )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value) #约束Value的训练，不要变化太大
@@ -237,6 +278,19 @@ class Dreamer(nn.Module):
         if config.compile:
             print("Compiling update function with torch.compile...")
             self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+
+    @staticmethod
+    def _check_value_ensemble_checkpoint(
+        module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        """Reject cross-mode loads before copying even shape-compatible parameters."""
+        key = prefix + "_categorical_quantile_marker"
+        if (key in state_dict) != module.mixed_value_ensemble:
+            raise RuntimeError("Value ensemble mode mismatch: categorical and categorical_quantile checkpoints differ")
+        if key in state_dict:
+            marker = state_dict[key]
+            if not torch.is_tensor(marker) or marker.ndim != 0 or marker.item() != 1:
+                raise RuntimeError("Unsupported categorical_quantile checkpoint marker")
 
     def _update_slow_target(self):
         """Update each slow value head from its matching online head."""
@@ -533,7 +587,10 @@ class Dreamer(nn.Module):
         # (value_ensemble_size, B*T, T_imag, 1)
         imag_values = torch.stack([head(imag_feat).mode() for head in self._frozen_value])
         imag_slow_values = torch.stack([head(imag_feat).mode() for head in self._frozen_slow_value])
-        if self.value_ensemble_size == 1:
+        if self.mixed_value_ensemble:
+            # Expectation of the equal categorical/quantile mixture, in raw returns.
+            imag_value = imag_values.mean(dim=0)
+        elif self.value_ensemble_size == 1:
             imag_value = imag_values[0]
         else:
             # One pair per update, shared by batch, time, bootstrap, and advantage.
@@ -614,7 +671,9 @@ class Dreamer(nn.Module):
 
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1) #补一个0，(M,15,1) -> (M,16,1)
-        losses["value"] = self._value_loss(imag_value_dist, tar_padded, imag_slow_values, weight, loss_mask)
+        losses["value"] = self._value_loss(
+            imag_value_dist, tar_padded, imag_slow_values, weight, loss_mask, metrics=metrics, prefix="value"
+        )
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -628,6 +687,8 @@ class Dreamer(nn.Module):
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_values)
         metrics["value_ensemble_std"] = imag_values.std(dim=0, unbiased=False).mean()
+        if self.mixed_value_ensemble:
+            metrics["value_ensemble_size"] = imag_value.new_tensor(self.value_ensemble_size)
         uncertainty_metric = f"imag_{self.uncer_metric}"
         metrics[uncertainty_metric] = imag_uncertainty.mean(dim=0)  # (H, 1), retaining the imagination time axis
         metrics["weight"] = torch.mean(weight)
@@ -653,8 +714,10 @@ class Dreamer(nn.Module):
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
         # Keep this attached to the world model so gradients can flow through
-        value_dist = [head(feat) for head in self.value]
-        losses["repval"] = self._value_loss(value_dist, ret_padded, slow_values, weight)
+        value_dist = self._replay_value_dist(feat)
+        losses["repval"] = self._value_loss(
+            value_dist, ret_padded, slow_values, weight, metrics=metrics, prefix="repval"
+        )
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
         metrics.update(tools.tensorstats(value, "value_replay"))
@@ -668,7 +731,14 @@ class Dreamer(nn.Module):
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), metrics
 
-    def _value_loss(self, value_dists, target, slow_values, weight, loss_mask=1.0):
+    def _replay_value_dist(self, feat):
+        """Detach only the quantile input when disabling its world-model contribution."""
+        return [
+            head(feat.detach() if self.mixed_value_ensemble and i == 1 and not self.quantile_repval_grad else feat)
+            for i, head in enumerate(self.value)
+        ]
+
+    def _value_loss(self, value_dists, target, slow_values, weight, loss_mask=1.0, *, metrics=None, prefix="value"):
         """Average member losses using one return target and a matching slow target per member.
 
         value_dists: list of distributions with batch (B, T), target/weight: (B, T, 1),
@@ -682,6 +752,9 @@ class Dreamer(nn.Module):
         for i, dist in enumerate(value_dists):
             nll = -dist.log_prob(target) - dist.log_prob(slow_values[i].detach())
             losses.append(torch.mean(weight * nll[:, :-1].unsqueeze(-1)))
+        if self.mixed_value_ensemble and metrics is not None:
+            for name, loss in zip(("categorical", "quantile"), losses):
+                metrics[f"loss/{prefix}_{name}"] = loss.detach()
         return torch.stack(losses).mean()
 
     @torch.no_grad()

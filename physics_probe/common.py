@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from importlib.metadata import version
 from pathlib import Path
 
@@ -30,6 +31,11 @@ def validate_device(device):
         raise ValueError(f"{device} is outside CUDA_VISIBLE_DEVICES={','.join(visible)}; use logical cuda:0")
 
 
+def validate_render_device():
+    if os.environ.get("MUJOCO_GL") != "egl" or os.environ.get("MUJOCO_EGL_DEVICE_ID") not in ("6", "7"):
+        raise ValueError("Vision rendering requires MUJOCO_GL=egl and MUJOCO_EGL_DEVICE_ID=6 or 7")
+
+
 def sha256(path):
     result = hashlib.sha256()
     with Path(path).open("rb") as f:
@@ -52,10 +58,23 @@ def new_directory(path):
     return path
 
 
-def make_manifest(root, output, tasks=None, seeds=None, distance_space=None, expected_count=None):
+def observation_mode(config):
+    """Read saved encoder selection rather than infer modality from the run name."""
+    if re.match(str(config.env.encoder.cnn_keys), "image"):
+        if str(config.env.encoder.mlp_keys) != "$^":
+            raise ValueError("Mixed image/proprio policy input is not supported by this probe")
+        return "vision"
+    if str(config.env.encoder.cnn_keys) == "$^":
+        return "proprio"
+    raise ValueError("Unsupported encoder observation selection")
+
+
+def make_manifest(root, output, tasks=None, seeds=None, distance_space=None, expected_count=None, modality="proprio"):
     root = Path(root)
     tasks = list(TASKS if tasks is None else tasks)
     seeds = list((200, 300) if seeds is None else seeds)
+    if modality not in ("proprio", "vision"):
+        raise ValueError("Select proprio or vision")
     if not tasks or len(set(tasks)) != len(tasks) or any(task not in TASKS for task in tasks):
         raise ValueError("Select unique supported tasks")
     if not seeds or len(set(seeds)) != len(seeds) or any(type(seed) is not int or seed < 0 for seed in seeds):
@@ -68,17 +87,17 @@ def make_manifest(root, output, tasks=None, seeds=None, distance_space=None, exp
     for task in tasks:
         for seed in seeds:
             matches = []
-            for path in sorted(root.glob(f"dmc_{task}_proprio_s{seed}_*/.hydra/config.yaml")):
+            for path in sorted(root.glob(f"dmc_{task}_{modality}_s{seed}_*/.hydra/config.yaml")):
                 cfg = OmegaConf.load(path)
                 if (
                     cfg.env.task == f"dmc_{task}"
                     and cfg.seed == seed
                     and cfg.model.value_ensemble_size == 5
                     and cfg.model.dynamic_trunc.enabled
-                    and cfg.model.uncer_metric == "wasser"
+                    and cfg.model.get("uncer_metric", cfg.model.get("VE_metric")) == "wasser"
                     and cfg.model.imag_horizon == 15
                     and cfg.model.rep_loss == "dreamer"
-                    and cfg.env.encoder.cnn_keys == "$^"
+                    and observation_mode(cfg) == modality
                     and (distance_space is None or cfg.model.get("distance_space", "raw") == distance_space)
                 ):
                     run = path.parent.parent
@@ -87,14 +106,16 @@ def make_manifest(root, output, tasks=None, seeds=None, distance_space=None, exp
             if len(matches) != 1:
                 raise ValueError(f"Expected one completed run for {task} seed {seed}, found: {matches}")
             run = matches[0]
-            entries.append({
-                "id": f"{task}_s{seed}",
-                "task": task,
-                "model_seed": seed,
-                "run": str(run),
-                "checkpoint_sha256": sha256(run / "latest.pt"),
-                "config_sha256": sha256(run / ".hydra/config.yaml"),
-            })
+            entries.append(
+                {
+                    "id": f"{task}_s{seed}",
+                    "task": task,
+                    "model_seed": seed,
+                    "run": str(run),
+                    "checkpoint_sha256": sha256(run / "latest.pt"),
+                    "config_sha256": sha256(run / ".hydra/config.yaml"),
+                }
+            )
     write_json(
         output,
         {
@@ -103,6 +124,7 @@ def make_manifest(root, output, tasks=None, seeds=None, distance_space=None, exp
             "tasks": tasks,
             "seeds": seeds,
             "distance_space_filter": distance_space,
+            "modality": modality,
             "entries": entries,
         },
     )
@@ -171,7 +193,8 @@ def provenance():
 
 @torch.no_grad()
 def posterior(agent, obs, state):
-    inputs = {k: torch.as_tensor(np.asarray(v).copy(), device=agent.device).reshape(1, -1) for k, v in obs.items()}
+    inputs = {k: torch.as_tensor(np.atleast_1d(v).copy(), device=agent.device).unsqueeze(0) for k, v in obs.items()}
+    inputs = agent.preprocess(inputs)
     embed = agent.encoder(inputs)
     z, h, _ = agent.rssm.obs_step(state["stoch"], state["deter"], state["prev_action"], embed, inputs["is_first"])
     feature = agent.rssm.get_feat(z, h)

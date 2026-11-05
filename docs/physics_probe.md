@@ -260,6 +260,48 @@ nice=19、2GiB PyTorch显存上限。其余训练超参数与首轮相同。
 
 ### 5. 测试 posterior 解码与真实续跑
 
+针对 `VE_wasser_symlog_f64_H15` 的9模型，使用专用入口 `physics_probe.stage4`。
+它只读取该组第三步的已保存 decoder 和 test episodes；不训练、不加载 Dreamer 到GPU，
+也不进行想象 feature 测试。重建路径保持 float64，原始观测仍为采集时的 float32。
+
+2026-11-05 首轮运行预算：每个模型20个测试episode，各取
+0/100/200/300/400/450步，feature 与 observation 对照各续跑最多50个策略步。
+9模型合计1080个起点、2160条解码恢复轨迹，另有每起点的完整快照和真实核心状态对照。
+
+```bash
+env CUDA_VISIBLE_DEVICES='' MUJOCO_GL=egl OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  nice -n 19 .venv/bin/python -u -m physics_probe.stage4 \
+  --source-root logdir/dyn_recon/physics_probe_stage3_symlog_f64_20261105 \
+  --output logdir/dyn_recon/physics_probe_stage4_symlog_f64_20261105 \
+  --points 0 100 200 300 400 450 --horizon 50 --sources features observations \
+  --cpus "${PROBE_CPU:?请先检查CPU负载并指定一个可用核}"
+```
+
+入口最多允许两个独立CPU worker，默认不隐式选择CPU；负载高时可使用上面的单核配置。
+本次按用户允许的并行方式运行两个单核 worker（CPU 69、89），nice=19、每worker单线程。
+GPU6允许使用，但本次每个episode只推理6个起点，实际执行选择CPU，无GPU分配。
+它在输出目录创建源码快照，再从快照运行各模型；不覆盖已有输出，不自动重试失败任务。
+所有分支执行同一段记录动作。完整快照参考先核对采集时的后续状态、观测、奖励和终止标志，
+核对失败的起点会明确列出，队列不会把它算作已通过的模型。
+
+输出 `status.json`、逐模型日志、各模型 `report.json` / `metrics.jsonl`，
+全部完成后生成 `REPORT.md`、`summary.csv` 和 `summary.json`。
+分别报告第0/1/5/15/50步的位置、速度、四元数方向、观测、奖励和累计奖励误差，
+包括均值/p95/最大值、异常数与有效起点覆盖。第0步额外比较解码状态与真实核心恢复的观测，
+辅助分离传感器缓存效应；此差值本身也不是科学验收阈值。
+后续深度只包含有有效指标的分支，必须结合异常和缺失数判读，不能把完成运行视为重建成功。
+
+本轮第一步接续图片仅保留第四步输出目录 `first_step_images_shared_view/` 下的3张任务汇总图，
+共享相机取景范围覆盖三个分支；原参考相机图片和单独帧已按用户要求删除。
+每模型使用测试 episode 60 / 环境 seed 50060，在策略步100恢复，执行同一条记录动作后只拍步101。
+左/中/右为 feature、observation、真实核心状态恢复；每张图包含该任务3个seed。
+`README.md` / `index.html` 仅引用这3张图；渲染入口也只保存这3张汇总图。
+各图的观测和速度误差与第四步存档核对一致；取景变化不修改物理坐标。
+`manifest.json` 保存动作、相机、数据选择、指标与源码hash，`render_script.py` 是对应源码副本。
+图像由 MuJoCo 在 GPU6 上实际渲染；单帧不能显示完整速度或触觉/IMU信息。
+
+下面的通用单decoder入口仍可用于小规模诊断：
+
 ```bash
 CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe evaluate \
   --dataset logdir/dyn_recon/physics_probe/finger_spin_s200_data \
@@ -308,3 +350,47 @@ MUJOCO_GL=egl CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 ```
 
 未安装 DMC extra 时，真实模拟器测试会明确 skip，不能视作已验证恢复。
+
+## 2026-11-05：VE_wasser_H15 的12个vision模型
+
+用户确认使用 `VE_wasser_H15` 下的 vision checkpoint：四任务
+finger_spin/hopper_hop/quadruped_run/walker_walk × seeds 0/100/200。
+每模型采集100个episode（最多500策略步），按episode 60/20/20划分，训练100轮。
+两个输入来源是冻结 vision Dreamer 的 posterior feature，以及同一时刻的单帧RGB图像。
+图像对照不输入proprio；保存的proprio仅用于物理诊断。两种decoder共24个，均使用float64。
+原Dreamer维持float32，64×64 RGB按原生 `preprocess` 除以255后进入encoder，绝不展平图像送CNN。
+
+image→state对照为四层stride=2、kernel=3、padding=1的卷积，通道16/32/64/128，
+每层SiLU，再接两个256单元的SiLU全连接层和状态输出层。batch=256、Adam lr=1e-3；
+像素输入固定归一化为 `pixel/255-0.5`，目标归一化仅根据训练集计算，几何loss沿用feature decoder。
+像素在数据及CPU批次中保持uint8，训练/推理时只将当前批次转float64。
+单帧CNN没有RSSM历史，因此对照的时间信息量不同，尤其不能假设单帧能唯一确定速度。
+
+步骤④沿用每测试episode的0/100/200/300/400/450步，共1440个起点、2880条解码恢复轨迹，
+另有1440条真实核心状态恢复及1440条完整快照参考，每条最多续跑50策略步。
+`observation_rmse`仍表示proprio诊断；另报`image_rmse_01`（RGB/255）和`image_max_abs_01`。
+完整快照的核心状态、proprio、奖励、终止匹配是参考校验；像素复现误差单独报告。
+预检12模型全部严格加载且采集器动作与原生actor逐值一致，状态恢复误差为0；
+部分hopper/quadruped渲染像素相差1灰度级，记录在预检中，不能表述成图像逐像素完全一致。
+
+资源：最初为GPU6上2个worker；用户随后授权扩容，现新增4个worker，总上限6个。
+每worker独立单核、PyTorch单线程、nice=19，PyTorch显存上限2GiB。
+EGL显式绑定 `MUJOCO_EGL_DEVICE_ID=6`，CUDA也限定6。队列使用源码快照，避免后续工作区编辑影响待运行模型。
+扩容记录见总队列目录的 `parallel_expansion.json`，新增worker状态和逐阶段日志位于
+`additional/extra1` 至 `additional/extra4`。它们调用原源码快照的stage锁，
+独立保存状态，不占用原辅助队列的 `parallel/<entry>` 目录，防止后续排队任务目录冲突。
+新增CPU为119/109/117/115，原CPU88/89继续运行；新增任务的结果仍写入同一个stage3目录。
+查看总进度时应结合主队列、原辅助队列、新增worker状态及各模型实际产物，避免漏算或重复计数。
+
+路径：
+
+- 预检：`logdir/dyn_recon/physics_probe_vision_20261105_preflight_v2/`。
+- 总队列：`logdir/dyn_recon/physics_probe_vision_20261105/`，查看`status.json`及各阶段日志。
+- 采集/训练：`logdir/dyn_recon/physics_probe_stage3_vision_20261105/`；主队列与辅助队列通过锁避免重复训练。
+- 续跑/汇总：`logdir/dyn_recon/physics_probe_stage4_vision_20261105/`。
+- 图片：续跑目录下`first_step_images/`，仅4张任务汇总PNG，分别包含三个seed；
+  从同一测试episode第100步恢复，仅保存执行一个相同动作后的第101步。
+
+`physics_probe.vision_campaign` 自动串联采集/训练、续跑、渲染。任一阶段失败会记录错误并停止后续阶段，
+不会覆盖已有数据或自动重试；没有启用想象feature测试，也没有将恢复采样接入Dreamer训练。
+正式启动前的 `vision_smoke` 只运行3个短episode和2轮训练，用于集成验证，不作为科学结果。

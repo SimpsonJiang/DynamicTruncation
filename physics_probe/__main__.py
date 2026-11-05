@@ -10,6 +10,7 @@ from .common import (
     load_agent,
     load_config,
     make_manifest,
+    observation_mode,
     select_entry,
     validate_device,
     write_json,
@@ -46,6 +47,7 @@ def parse_args():
     manifest.add_argument("--seeds", nargs="+", type=int)
     manifest.add_argument("--distance-space", choices=("raw", "symlog"))
     manifest.add_argument("--expected-count", type=positive_int)
+    manifest.add_argument("--modality", choices=("proprio", "vision"), default="proprio")
     for name in ("checkpoint-check", "restore-check", "collect"):
         p = commands.add_parser(name)
         p.add_argument("--manifest", type=Path, required=True)
@@ -64,7 +66,7 @@ def parse_args():
     p = commands.add_parser("fit")
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--source", choices=("features", "observations"), required=True)
+    p.add_argument("--source", choices=("features", "observations", "images"), required=True)
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--device", required=True)
     p.add_argument("--epochs", type=positive_int, required=True)
@@ -101,14 +103,15 @@ def main():
         raise FileExistsError(f"Refusing to overwrite experiment output: {args.output}")
     if args.command == "manifest":
         entries = make_manifest(
-            args.root, args.output, args.tasks, args.seeds, args.distance_space, args.expected_count
+            args.root, args.output, args.tasks, args.seeds, args.distance_space, args.expected_count, args.modality
         )
         print(f"Manifest: {len(entries)} independent models -> {args.output}")
         return
     if hasattr(args, "manifest"):
         entry = select_entry(args.manifest, args.entry)
     if args.command == "checkpoint-check":
-        env = ProbeEnv(load_config(entry).env, args.seed)
+        config = load_config(entry)
+        env = ProbeEnv(config.env, args.seed, include_image=observation_mode(config) == "vision")
         try:
             agent = load_agent(entry, env, args.device)
             write_json(

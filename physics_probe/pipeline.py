@@ -13,14 +13,16 @@ from .common import (
     load_agent,
     load_config,
     new_directory,
+    observation_mode,
     posterior,
     provenance,
     sha256,
     statistics,
     validate_device,
+    validate_render_device,
     write_json,
 )
-from .decoder import StateDecoder
+from .decoder import ImageStateDecoder, StateDecoder
 from .environment import ProbeEnv, observation_vector, state_errors, tensor
 
 
@@ -95,7 +97,10 @@ def collect(entry, output, seed, episodes, max_steps, device):
     output = new_directory(output)
     torch.manual_seed(seed)
     config = load_config(entry, device)
-    env = ProbeEnv(config.env, seed)
+    modality = observation_mode(config)
+    if modality == "vision":
+        validate_render_device()
+    env = ProbeEnv(config.env, seed, include_image=modality == "vision")
     try:
         agent = load_agent(entry, env, device)
         records = []
@@ -104,15 +109,28 @@ def collect(entry, output, seed, episodes, max_steps, device):
             # Independent reset seeds; no overlap with earlier episode seeds.
             if episode:
                 env.close()
-                env = ProbeEnv(config.env, seed + episode)
+                env = ProbeEnv(config.env, seed + episode, include_image=modality == "vision")
             obs = env.observation(first=True)
             state = agent.get_initial_state(1)
-            features, observations, snapshots, actions, rewards, dones, zs, hs = [], [], [], [], [], [], [], []
+            features, observations, snapshots, actions, rewards, dones, zs, hs, images = (
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
             for _ in range(max_steps):
                 snapshot = env.snapshot()
                 feature, action, state = posterior(agent, obs, state)
                 features.append(feature[0].cpu())
-                observations.append(tensor(observation_vector(obs)))
+                # Save proprio separately for physics diagnostics, never as the vision CNN's input.
+                observations.append(tensor(observation_vector({k: v for k, v in obs.items() if k != "image"})))
+                if modality == "vision":
+                    images.append(tensor(obs["image"]))
                 snapshots.append(snapshot)
                 zs.append(state["stoch"][0].cpu())
                 hs.append(state["deter"][0].cpu())
@@ -137,17 +155,21 @@ def collect(entry, output, seed, episodes, max_steps, device):
                 "complete_episode": bool(dones[-1]),
                 "schema": env.schema(),
             }
+            if modality == "vision":
+                shard["images"] = torch.stack(images)
             path = output / f"episode_{episode:05d}.pt"
             torch.save(shard, path)
-            records.append({
-                "path": path.name,
-                "sha256": sha256(path),
-                "episode_id": episode,
-                "episode_seed": seed + episode,
-                "samples": len(features),
-                "complete_episode": shard["complete_episode"],
-                "elapsed_seconds": time.monotonic() - episode_started,
-            })
+            records.append(
+                {
+                    "path": path.name,
+                    "sha256": sha256(path),
+                    "episode_id": episode,
+                    "episode_seed": seed + episode,
+                    "samples": len(features),
+                    "complete_episode": shard["complete_episode"],
+                    "elapsed_seconds": time.monotonic() - episode_started,
+                }
+            )
             print(
                 f"Collected {entry['id']} episode {episode}: {len(features)} states, "
                 f"{records[-1]['elapsed_seconds']:.1f}s",
@@ -161,8 +183,21 @@ def collect(entry, output, seed, episodes, max_steps, device):
             "seed": seed,
             "max_steps": max_steps,
             "device": device,
-            "obs_keys": sorted(env.observation_space.spaces),
+            "obs_keys": sorted(k for k in env.observation_space.spaces if k != "image"),
+            "policy_input_keys": ["image"] if modality == "vision" else sorted(env.observation_space.spaces),
             "policy": "stochastic frozen actor",
+            "policy_modality": modality,
+            "observation_control": "single RGB image; no proprio input" if modality == "vision" else "proprio",
+            "observation_metrics": "proprio scalar fields; not image pixels",
+            "image_input": (
+                {
+                    "shape": list(env.image_size) + [3],
+                    "camera_id": env.camera_id,
+                    "preprocess": "uint8 / 255.0 before native encoder",
+                }
+                if modality == "vision"
+                else None
+            ),
             "feature_dtype": str(shard["features"].dtype),
             "label_dtype": str(shard["cores"].dtype),
             "frozen_parameter_dtypes": sorted({str(p.dtype) for p in agent.parameters()}),
@@ -202,13 +237,15 @@ def episode_split(meta, seed):
 
 def arrays(path, meta, ids, source):
     shards = [load_shard(path, meta["episodes"][i]) for i in ids]
+    if source == "images" and any(s[source].dtype != torch.uint8 for s in shards):
+        raise ValueError("Image control requires original uint8 pixels, not rescaled floats")
     if any(s["cores"].dtype != torch.float64 for s in shards):
         raise ValueError(
             "float64 decoder training requires original float64 core labels; recasting cannot recover precision"
         )
     # Preserve simulator label precision; never round via float32 first.
     return (
-        torch.cat([s[source] for s in shards]).to(torch.float64),
+        torch.cat([s[source] for s in shards]).to(torch.uint8 if source == "images" else torch.float64),
         torch.cat([s["cores"] for s in shards]).to(torch.float64),
     )
 
@@ -221,8 +258,14 @@ def fit(dataset, output, source, seed, epochs, batch_size, hidden, lr, device):
     torch.manual_seed(seed)
     x, y = arrays(path, meta, split["train"], source)
     vx, vy = arrays(path, meta, split["validation"], source)
-    model = StateDecoder(x.shape[-1], meta["schema"], hidden, dtype=torch.float64).to(device)
-    model.normalize_from_training(x.to(device), y.to(device))
+    if source == "images":
+        if x.dtype != torch.uint8 or vx.dtype != torch.uint8:
+            raise ValueError("CNN requires original uint8 RGB data")
+        model = ImageStateDecoder(x.shape[1:], meta["schema"], hidden, dtype=torch.float64).to(device)
+        model.normalize_from_training(x[:1].to(device), y.to(device))
+    else:
+        model = StateDecoder(x.shape[-1], meta["schema"], hidden, dtype=torch.float64).to(device)
+        model.normalize_from_training(x.to(device), y.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     generator = torch.Generator().manual_seed(seed)
     history, best, best_export = [], float("inf"), None
@@ -315,14 +358,16 @@ def evaluate(dataset, checkpoint, output, device, stride, horizon, max_starts):
                 try:
                     a.restore(shard["snapshots"][t])
                     ob = b.restore(shard["snapshots"][t], predictions[t])
-                    rollout_rows.append({
-                        "depth": 0,
-                        "episode": episode,
-                        "start": t,
-                        "observation_rmse": float(
-                            np.sqrt(np.mean((observation_vector(ob) - shard["observations"][t].numpy()) ** 2))
-                        ),
-                    })
+                    rollout_rows.append(
+                        {
+                            "depth": 0,
+                            "episode": episode,
+                            "start": t,
+                            "observation_rmse": float(
+                                np.sqrt(np.mean((observation_vector(ob) - shard["observations"][t].numpy()) ** 2))
+                            ),
+                        }
+                    )
                     for depth, action in enumerate(shard["actions"][t : t + horizon].numpy(), 1):
                         errors, done = compare_step(a, b, action)
                         rollout_rows.append({"depth": depth, "episode": episode, "start": t, **errors})
@@ -404,13 +449,15 @@ def imagine_check(dataset, checkpoint, output, device, stride, horizon, max_star
                             )
                             restored_ok = True
                         except (ValueError, RuntimeError, ArithmeticError) as exc:
-                            failures.append({
-                                "episode": episode,
-                                "start": t,
-                                "depth": depth,
-                                "stage": "decoded_restore",
-                                "error": str(exc),
-                            })
+                            failures.append(
+                                {
+                                    "episode": episode,
+                                    "start": t,
+                                    "depth": depth,
+                                    "stage": "decoded_restore",
+                                    "error": str(exc),
+                                }
+                            )
                         errors["restore_failed"] = float(not restored_ok)
                         row = {
                             "episode": episode,
@@ -427,22 +474,26 @@ def imagine_check(dataset, checkpoint, output, device, stride, horizon, max_star
                             if restored_ok:
                                 try:
                                     _, predicted_reward, predicted_done = restored.step(action)
-                                    row.update({
-                                        f"next_{k}": v
-                                        for k, v in state_errors(
-                                            restored.core_state(), env.core_state(), meta["schema"]
-                                        ).items()
-                                    })
+                                    row.update(
+                                        {
+                                            f"next_{k}": v
+                                            for k, v in state_errors(
+                                                restored.core_state(), env.core_state(), meta["schema"]
+                                            ).items()
+                                        }
+                                    )
                                     row["next_reward_abs"] = abs(predicted_reward - true_reward)
                                     row["next_done_mismatch"] = float(done != predicted_done)
                                 except (ValueError, RuntimeError, ArithmeticError) as exc:
-                                    failures.append({
-                                        "episode": episode,
-                                        "start": t,
-                                        "depth": depth,
-                                        "stage": "decoded_step",
-                                        "error": str(exc),
-                                    })
+                                    failures.append(
+                                        {
+                                            "episode": episode,
+                                            "start": t,
+                                            "depth": depth,
+                                            "stage": "decoded_step",
+                                            "error": str(exc),
+                                        }
+                                    )
                                     row["restore_failed"] = 1.0
                         rows.append(row)
                         if depth == horizon:
