@@ -47,16 +47,36 @@ Dynamic imagination truncation is enabled by default. Each trajectory uses its
 current-state score selected by `model.uncer_metric` (`wasser` by default), a
 lagged EMA of the first-step 95th percentile (decay 0.999), and a minimum of 8 steps.
 Returns bootstrap at the truncation boundary; actor and imagined value losses use
-the retained prefix. To use the full imagination horizon:
+the retained prefix. `model.dynamic_trunc.warmup_steps=50000` delays masking until
+the trainer's logged `Step` reaches 50k (summed across environments, including
+`action_repeat`, not optimizer updates). During warmup, uncertainty and threshold
+EMA still update, while returns and losses use the full horizon. Set it to `0`
+for immediate truncation. In `uv_run.sh`, edit `trunc_warmup_steps`.
+`train/dynamic_trunc/active` logs whether truncation is currently active.
+To use the full imagination horizon throughout training:
 
 ```bash
 python3 train.py model.rep_loss=dreamer model.dynamic_trunc.enabled=false
 ```
 
-`wasser` uses mean pairwise Wasserstein-1 distance on the raw return bins.
+`model.distance_space=raw` (default) uses the original return bins for `wasser`,
+`cramer`, and `sqrt_cramer`. Set it to `symlog` to integrate CDF differences with
+widths `symlog(bins).diff()` instead. The default critic's 255 bins are uniformly
+spaced in symlog coordinates, reducing the weighting of tail discrepancies.
+Probabilities stay unchanged; tail probability differences still contribute.
+This option does not affect `ucb` or `sigma`. In `uv_run.sh`, set
+`distance_space=symlog`; use a distinct `METHOD_TEMPLATE` for each experiment.
+
+```bash
+python3 train.py model.uncer_metric=wasser model.distance_space=symlog
+python3 train.py model.uncer_metric=cramer model.distance_space=symlog
+python3 train.py model.uncer_metric=sqrt_cramer model.distance_space=symlog
+```
+
+`wasser` uses mean pairwise Wasserstein-1 distance in the selected space.
 `cramer` uses the squared Cramer score, while `sqrt_cramer` uses the Cramer
-distance. Both compare full-distribution CDFs using the same nonuniform raw
-return bins as W1:
+distance. Both compare full-distribution CDFs using the same selected bin
+coordinates as W1 (`x` below is either raw return or symlog return):
 
 \[
 C_{ij}^{2}=\sum_{b=0}^{D-2}(F_i(b)-F_j(b))^2(x_{b+1}-x_b),\qquad

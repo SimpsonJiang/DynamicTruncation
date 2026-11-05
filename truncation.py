@@ -3,20 +3,23 @@
 import torch
 from torch import nn
 
+from distributions import symlog
+
 
 @torch.no_grad()
-def cal_ens_uncertainty(imag_value_dist, imag_value, metric, *, beta=0.1):
+def cal_ens_uncertainty(imag_value_dist, imag_value, metric, *, beta=0.1, distance_space="raw"):
     """Return detached float32 uncertainty with shape (B*T, H, 1).
 
     imag_value_dist is the list of K online value distributions with batch shape
     (B*T, H+1). imag_value contains *all* K heads' scalar predictions, with shape
     (K, B*T, H+1, 1), not the two-head bootstrap mean. The last state is excluded.
     Only inputs needed by the selected metric are evaluated. beta affects UCB only.
+    distance_space selects raw or symlog bins for W1 and both Cramer scores.
     """
     if metric == "wasser":
-        return _imag_wasserstein(imag_value_dist)
+        return _imag_wasserstein(imag_value_dist, space=distance_space)
     if metric in ("cramer", "sqrt_cramer"):
-        return _imag_cramer(imag_value_dist, take_sqrt=metric == "sqrt_cramer")
+        return _imag_cramer(imag_value_dist, take_sqrt=metric == "sqrt_cramer", space=distance_space)
     if metric == "ucb":
         return _imag_ucb(imag_value, beta=beta)
     if metric == "sigma":
@@ -43,9 +46,20 @@ def _imag_sigma(imag_value):
     return torch.std(values, dim=0, unbiased=True)
 
 
+def _distance_bin_widths(value_dist, space):
+    """Integrate CDF differences in the selected return coordinate system."""
+    if space not in ("raw", "symlog"):
+        raise ValueError("model.distance_space must be 'raw' or 'symlog'")
+    bins = value_dist.bins.detach().to(dtype=torch.float64)
+    if space == "symlog":
+        bins = symlog(bins)
+    return bins.diff()
+
+
 @torch.no_grad()
-def _imag_wasserstein(value_dists):
-    """Mean pairwise W1: float64 softmax/CDF/integration, float32 output."""
+def _imag_wasserstein(value_dists, *, space="raw"):
+    """Mean pairwise W1 on raw or symlog bins; float64 math, float32 output."""
+    widths = _distance_bin_widths(value_dists[0], space)
     if len(value_dists) == 1:
         return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
     # Recompute probabilities: casting float32 softmax output retains mass errors
@@ -54,7 +68,6 @@ def _imag_wasserstein(value_dists):
         dist.logits.detach()[:, :-1].to(dtype=torch.float64).softmax(dim=-1).cumsum(dim=-1)[..., :-1]
         for dist in value_dists
     ]
-    widths = value_dists[0].bins.detach().to(dtype=torch.float64).diff()
     total = torch.zeros_like(cdfs[0][..., :1])
     for i in range(len(cdfs)):
         for j in range(i + 1, len(cdfs)):
@@ -63,18 +76,19 @@ def _imag_wasserstein(value_dists):
 
 
 @torch.no_grad()
-def _imag_cramer(value_dists, take_sqrt=False):
+def _imag_cramer(value_dists, take_sqrt=False, *, space="raw"):
     """Mean pairwise squared Cramer score, optionally rooted before averaging.
 
-    Softmax, CDF, integration, and optional roots use float64; output is float32.
+    Integrate on raw or symlog bins. Softmax, CDF, integration, and optional roots
+    use float64; output is float32.
     """
+    widths = _distance_bin_widths(value_dists[0], space)
     if len(value_dists) == 1:
         return torch.zeros_like(value_dists[0].probs[:, :-1, :1], dtype=torch.float32)
     cdfs = [
         dist.logits.detach()[:, :-1].to(dtype=torch.float64).softmax(dim=-1).cumsum(dim=-1)[..., :-1]
         for dist in value_dists
     ]
-    widths = value_dists[0].bins.detach().to(dtype=torch.float64).diff()
     total = torch.zeros_like(cdfs[0][..., :1])
     for i in range(len(cdfs)):
         for j in range(i + 1, len(cdfs)):

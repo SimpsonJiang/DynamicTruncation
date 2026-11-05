@@ -14,8 +14,9 @@ from .common import (
     validate_device,
     write_json,
 )
-from .environment import ProbeEnv
+from .environment import TASKS, ProbeEnv
 from .pipeline import collect, evaluate, fit, imagine_check, restore_check
+from .prediction import prediction_check
 
 
 def positive_int(value):
@@ -36,9 +37,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--threads", type=positive_int, default=1, help="CPU PyTorch threads (default 1).")
     commands = parser.add_subparsers(dest="command", required=True)
-    manifest = commands.add_parser("manifest", help="Find exactly the agreed four tasks x seeds 200/300.")
+    manifest = commands.add_parser(
+        "manifest", help="Select an explicit task/seed grid; defaults to four tasks x seeds 200/300."
+    )
     manifest.add_argument("--root", type=Path, default=Path("logdir/VE_wasser_H15"))
     manifest.add_argument("--output", type=Path, required=True)
+    manifest.add_argument("--tasks", nargs="+", choices=TASKS)
+    manifest.add_argument("--seeds", nargs="+", type=int)
+    manifest.add_argument("--distance-space", choices=("raw", "symlog"))
+    manifest.add_argument("--expected-count", type=positive_int)
     for name in ("checkpoint-check", "restore-check", "collect"):
         p = commands.add_parser(name)
         p.add_argument("--manifest", type=Path, required=True)
@@ -73,6 +80,12 @@ def parse_args():
         p.add_argument("--stride", type=positive_int, required=True)
         p.add_argument("--horizon", type=positive_int, required=True, help="Policy/action-repeat steps")
         p.add_argument("--max-starts", type=positive_int, required=True)
+    p = commands.add_parser("prediction-check", help="Stage 3: held-out prediction only, no simulation rollout")
+    p.add_argument("--dataset", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--device", required=True)
+    p.add_argument("--batch-size", type=positive_int, default=256)
     args = parser.parse_args()
     if hasattr(args, "seed") and args.seed < 0:
         parser.error("seed must be non-negative")
@@ -87,7 +100,9 @@ def main():
     if args.output.exists():
         raise FileExistsError(f"Refusing to overwrite experiment output: {args.output}")
     if args.command == "manifest":
-        entries = make_manifest(args.root, args.output)
+        entries = make_manifest(
+            args.root, args.output, args.tasks, args.seeds, args.distance_space, args.expected_count
+        )
         print(f"Manifest: {len(entries)} independent models -> {args.output}")
         return
     if hasattr(args, "manifest"):
@@ -124,6 +139,8 @@ def main():
             args.lr,
             args.device,
         )
+    elif args.command == "prediction-check":
+        prediction_check(args.dataset, args.checkpoint, args.output, args.device, args.batch_size)
     else:
         function = evaluate if args.command == "evaluate" else imagine_check
         function(args.dataset, args.checkpoint, args.output, args.device, args.stride, args.horizon, args.max_starts)

@@ -133,3 +133,4 @@ dmypy.json
 AGENTS.md
 run.sh
 run_uv.sh
+figures/

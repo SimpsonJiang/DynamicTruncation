@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==== Settings ====
-METHOD_TEMPLATE='VE_{metric}_f64_H{horizon}' # Edit prefix/suffix here; placeholders expand per job.
+METHOD_TEMPLATE='VE_{metric}_symlog_w{trunc_warmup_steps/1000}k_f64_H{horizon}' # Placeholders expand per job.
 # Maximum concurrent training jobs per GPU: [GPU index]=job limit.
 declare -A GPU_MAX_JOBS=(
     [6]=4
@@ -15,6 +15,8 @@ imag_horis=(
 )
 
 enable_dny_trunc=true
+trunc_warmup_steps=50000 # trainer Step; 0 enables truncation immediately
+distance_space=symlog # raw / symlog; affects wasser / cramer / sqrt_cramer
 uncer_metrics=(
     wasser
 )
@@ -75,6 +77,7 @@ train_job() {
     local task=$1 seed=$2 uncer_metric=$3 imag_hori=$4 status
     local method=${METHOD_TEMPLATE//\{metric\}/$uncer_metric}
     method=${method//\{horizon\}/$imag_hori}
+    method=${method//\{trunc_warmup_steps\/1000\}/$((trunc_warmup_steps / 1000))}
     if [[ -z ${TMUX:-} ]]; then
         echo "Error: training must run inside tmux." >&2
         exit 1
@@ -92,7 +95,9 @@ train_job() {
             buffer.storage_device=cuda:0 \
             model.rep_loss=dreamer \
             "model.dynamic_trunc.enabled=${enable_dny_trunc}" \
+            "model.dynamic_trunc.warmup_steps=${trunc_warmup_steps}" \
             "model.uncer_metric=${uncer_metric}" \
+            "model.distance_space=${distance_space}" \
             "model.imag_horizon=${imag_hori}" \
             "seed=$seed"; then
         printf '[GPU %s] Finished task=%s seed=%s uncer_metric=%s imag_hori=%s\n' \
@@ -157,6 +162,8 @@ for ((worker_index = 0; worker_index < worker_count; worker_index++)); do
         printf 'GPU_ID=%q\nPYTHON=%q\nMODAL=%q\nDATE=%q\nFAILED=0\n' \
             "$gpu" "$PYTHON" "$MODAL" "$DATE"
         printf 'enable_dny_trunc=%q\n' "$enable_dny_trunc"
+        printf 'trunc_warmup_steps=%q\n' "$trunc_warmup_steps"
+        printf 'distance_space=%q\n' "$distance_space"
         printf 'METHOD_TEMPLATE=%q\n' "$METHOD_TEMPLATE"
         declare -f train_job
     } > "$worker"

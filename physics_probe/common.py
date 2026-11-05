@@ -52,11 +52,21 @@ def new_directory(path):
     return path
 
 
-def make_manifest(root, output):
+def make_manifest(root, output, tasks=None, seeds=None, distance_space=None, expected_count=None):
     root = Path(root)
+    tasks = list(TASKS if tasks is None else tasks)
+    seeds = list((200, 300) if seeds is None else seeds)
+    if not tasks or len(set(tasks)) != len(tasks) or any(task not in TASKS for task in tasks):
+        raise ValueError("Select unique supported tasks")
+    if not seeds or len(set(seeds)) != len(seeds) or any(type(seed) is not int or seed < 0 for seed in seeds):
+        raise ValueError("Select unique non-negative integer seeds")
+    if distance_space not in (None, "raw", "symlog"):
+        raise ValueError("distance_space must be raw or symlog")
+    if expected_count is not None and len(tasks) * len(seeds) != expected_count:
+        raise ValueError("Requested task/seed grid does not match expected checkpoint count")
     entries = []
-    for task in TASKS:
-        for seed in (200, 300):
+    for task in tasks:
+        for seed in seeds:
             matches = []
             for path in sorted(root.glob(f"dmc_{task}_proprio_s{seed}_*/.hydra/config.yaml")):
                 cfg = OmegaConf.load(path)
@@ -69,6 +79,7 @@ def make_manifest(root, output):
                     and cfg.model.imag_horizon == 15
                     and cfg.model.rep_loss == "dreamer"
                     and cfg.env.encoder.cnn_keys == "$^"
+                    and (distance_space is None or cfg.model.get("distance_space", "raw") == distance_space)
                 ):
                     run = path.parent.parent
                     if (run / "latest.pt").is_file():
@@ -84,7 +95,17 @@ def make_manifest(root, output):
                 "checkpoint_sha256": sha256(run / "latest.pt"),
                 "config_sha256": sha256(run / ".hydra/config.yaml"),
             })
-    write_json(output, {"version": 1, "group": root.name, "entries": entries})
+    write_json(
+        output,
+        {
+            "version": 1,
+            "group": root.name,
+            "tasks": tasks,
+            "seeds": seeds,
+            "distance_space_filter": distance_space,
+            "entries": entries,
+        },
+    )
     return entries
 
 

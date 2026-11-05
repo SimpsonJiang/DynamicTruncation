@@ -40,12 +40,22 @@ class Dreamer(nn.Module):
         self.uncer_metric = str(config.get("uncer_metric", "wasser"))
         if self.uncer_metric not in ("wasser", "ucb", "sigma", "cramer", "sqrt_cramer"):
             raise ValueError("model.uncer_metric must be 'wasser', 'ucb', 'sigma', 'cramer' or 'sqrt_cramer'")
+        self.distance_space = str(config.get("distance_space", "raw"))
+        if self.distance_space not in ("raw", "symlog"):
+            raise ValueError("model.distance_space must be 'raw' or 'symlog'")
         self.ucb_beta = float(config.get("beta", 0.1))
         if not math.isfinite(self.ucb_beta) or self.ucb_beta < 0:
             raise ValueError("model.beta must be finite and non-negative")
 
         trunc = config.get("dynamic_trunc", {})
         self.dynamic_trunc_enabled = bool(trunc.get("enabled", True))
+        self.dynamic_trunc_warmup_steps = trunc.get("warmup_steps", 50_000)
+        if (
+            isinstance(self.dynamic_trunc_warmup_steps, bool)
+            or not isinstance(self.dynamic_trunc_warmup_steps, int)
+            or self.dynamic_trunc_warmup_steps < 0
+        ):
+            raise ValueError("dynamic_trunc.warmup_steps must be a non-negative integer")
         if self.dynamic_trunc_enabled and self.value_ensemble_size < 2:
             raise ValueError(
                 "Dynamic truncation requires at least 2 value heads; "
@@ -347,8 +357,8 @@ class Dreamer(nn.Module):
         error = (model - truth + 1.0) / 2.0
         return torch.cat([truth, model, error], 2)
 
-    def update(self, replay_buffer):
-        """Sample a batch from replay and perform one optimization step."""
+    def update(self, replay_buffer, *, env_step=0):
+        """Optimize one batch; env_step uses the trainer's action-repeat-scaled Step."""
         data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
@@ -356,8 +366,10 @@ class Dreamer(nn.Module):
         if self.rep_loss == "dreamerpro":
             self.ema_update()
         metrics = {}
+        # Only a boolean enters the compiled function, not the changing environment step.
+        truncation_active = self.dynamic_trunc_enabled and env_step >= self.dynamic_trunc_warmup_steps
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
+            (stoch, deter), mets = self._cal_grad(p_data, initial, truncation_active=truncation_active)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
@@ -386,7 +398,7 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
-    def _cal_grad(self, data, initial):
+    def _cal_grad(self, data, initial, *, truncation_active=None):
         """Compute gradients for one batch.
 
         Notes
@@ -400,6 +412,10 @@ class Dreamer(nn.Module):
         # data: dict of (B, T, *), initial: (stoch: (B, S, K), deter: (B, D))
         losses = {}
         metrics = {}
+        # Direct calls without a trainer step are treated as Step 0.
+        if truncation_active is None:
+            truncation_active = self.dynamic_trunc_warmup_steps == 0
+        truncation_active = self.dynamic_trunc_enabled and truncation_active
         B, T = data.shape
 
         # === World model: posterior rollout and KL losses ===
@@ -500,29 +516,37 @@ class Dreamer(nn.Module):
             imag_value = imag_values.index_select(0, value_pair).mean(dim=0)
         imag_value_dist = [head(imag_feat) for head in self.value]
         # (B*T, H, 1): each trajectory gates on its own current-state score.
-        imag_uncertainty = cal_ens_uncertainty(imag_value_dist, imag_values, self.uncer_metric, beta=self.ucb_beta)
+        imag_uncertainty = cal_ens_uncertainty(
+            imag_value_dist, imag_values, self.uncer_metric, beta=self.ucb_beta, distance_space=self.distance_space
+        )
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
         loss_mask = 1.0
+        last = torch.zeros_like(imag_cont)
         if self.dynamic_trunc_enabled:
             raw_threshold = torch.quantile(imag_uncertainty[:, 0].reshape(-1), self.dynamic_trunc_quantile)
             raw_threshold = raw_threshold * self.dynamic_trunc_threshold_scale
             threshold = self.trunc_kappa(raw_threshold)
-            trunc_mask = build_truncation_mask(imag_uncertainty, threshold, self.dynamic_trunc_min_horizon)
-            loss_mask = normalized_mask(trunc_mask)
-            last = mask_to_last(trunc_mask)
+            if truncation_active:
+                trunc_mask = build_truncation_mask(imag_uncertainty, threshold, self.dynamic_trunc_min_horizon)
+                loss_mask = normalized_mask(trunc_mask)
+                last = mask_to_last(trunc_mask)
+                keep_rate = trunc_mask.float().mean()
+                effective_horizon = trunc_mask.float().sum(dim=1).mean()
+            else:
+                keep_rate = imag_uncertainty.new_tensor(1.0)
+                effective_horizon = imag_uncertainty.new_tensor(float(self.imag_horizon))
+            metrics["dynamic_trunc/active"] = imag_uncertainty.new_tensor(float(truncation_active))
             metrics["dynamic_trunc/threshold_raw"] = raw_threshold
             metrics["dynamic_trunc/threshold"] = threshold
-            metrics["dynamic_trunc/keep_rate"] = trunc_mask.float().mean()
-            metrics["dynamic_trunc/effective_horizon"] = trunc_mask.float().sum(dim=1).mean()
-        else:
-            last = torch.zeros_like(imag_cont)
+            metrics["dynamic_trunc/keep_rate"] = keep_rate
+            metrics["dynamic_trunc/effective_horizon"] = effective_horizon
         term = 1 - imag_cont
         ret = self._lambda_return(
             last, term, imag_reward, imag_value, imag_value, disc, self.lamb
         )  # (B*T, T_imag-1, 1)
-        ret_for_stats = torch.where(trunc_mask, ret, imag_value[:, :-1]) if self.dynamic_trunc_enabled else ret
+        ret_for_stats = torch.where(trunc_mask, ret, imag_value[:, :-1]) if truncation_active else ret
         ret_offset, ret_scale = self.return_ema(ret_for_stats)
         # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale

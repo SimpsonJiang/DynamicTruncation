@@ -17,12 +17,14 @@ beta2: 0.999
 warmup: 1000
 value_ensemble_size: 5
 uncer_metric: wasser # wasser / ucb / sigma / cramer / sqrt_cramer
+distance_space: raw # raw / symlog; bin coordinates for wasser / cramer / sqrt_cramer
 beta: 0.1
 slow_target_update: 1
 slow_target_fraction: 0.02
 
 dynamic_trunc:
   enabled: true
+  warmup_steps: 50000 # trainer Step (includes action_repeat); 0 enables truncation immediately
   quantile: 0.95
   threshold_scale: 1.0
   threshold_ema: 0.999

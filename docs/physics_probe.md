@@ -3,9 +3,19 @@
 本工具用于验证 feature 是否能恢复可继续仿真的物理状态。它不修改 Dreamer 训练代码，
 不把物理标签送入 encoder，也不把恢复后的分支采样写回训练 replay。
 
-已约定的范围：`VE_wasser_H15`，proprio `finger_spin/hopper_hop/quadruped_run/walker_walk`，
+首轮范围：`VE_wasser_H15`，proprio `finger_spin/hopper_hop/quadruped_run/walker_walk`，
 模型 seeds `200/300`，每个任务与 seed 独立训练一个 feature decoder（共 8 个）。
 `observations` 输入用于可选对照，不与 feature decoder 混合训练。
+
+2026-11-05 重跑组：`VE_wasser_symlog_f64_H15`，proprio
+`finger_spin/hopper_hop/quadruped_run` × seeds `1/42/100`，共9个checkpoint、18个decoder。
+每模型100个episode、100轮训练、相同数据/训练seed及60/20/20划分；结果单独保存，
+不覆盖首轮。该组没有walker；目录名中的f64不用于推断世界模型参数精度，加载时以实际张量为准。
+
+从 2026-11-04 起，新训练的重建模块统一使用 **float64**：decoder 参数、标准化统计、
+标签、loss、参数梯度、Adam 动量以及解码输出均为 float64，恢复状态继续使用 float64。
+冻结 Dreamer 的计算精度不改变；其 feature 只在进入 decoder 时转换为 float64，
+这种转换不会补回 feature 原先精度之外的信息。不启用全局 `torch.set_default_dtype`。
 
 ## 环境与设备
 
@@ -36,18 +46,29 @@ CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe ... --dev
 
 ```bash
 .venv/bin/python -m physics_probe manifest \
-  --root logdir/VE_wasser_H15 --output logdir/physics_probe/manifest.json
+  --root logdir/VE_wasser_H15 --output logdir/dyn_recon/physics_probe/manifest.json
 ```
 
 检查保存配置中的任务、seed、proprio、5 heads、开启截断、wasser、H15、dreamer。
 每个任务/seed 必须恰好找到一个 `latest.pt`；缺失或有歧义时报错，不替用户选模型。
+可用 `--tasks`、`--seeds`、`--distance-space` 和 `--expected-count` 明确选择其他已确认组。
+例如这次9个symlog checkpoint的清单：
+
+```bash
+.venv/bin/python -m physics_probe manifest \
+  --root logdir/VE_wasser_symlog_f64_H15 \
+  --tasks finger_spin hopper_hop quadruped_run --seeds 1 42 100 \
+  --distance-space symlog --expected-count 9 \
+  --output logdir/dyn_recon/symlog_manifest.json
+```
+
 清单保存 checkpoint/config SHA256，后续会校验。该命令只检查文件和配置，
 可用下面的命令另外验证严格加载：
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe checkpoint-check \
-  --manifest logdir/physics_probe/manifest.json --entry finger_spin_s200 \
-  --seed 12345 --device cuda:0 --output logdir/physics_probe/finger_spin_s200_load.json
+  --manifest logdir/dyn_recon/physics_probe/manifest.json --entry finger_spin_s200 \
+  --seed 12345 --device cuda:0 --output logdir/dyn_recon/physics_probe/finger_spin_s200_load.json
 ```
 
 其余 entry 为 `finger_spin_s300`、`hopper_hop_s200`、`hopper_hop_s300`、
@@ -57,9 +78,9 @@ CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe checkpoin
 
 ```bash
 MUJOCO_GL=egl .venv/bin/python -m physics_probe restore-check \
-  --manifest logdir/physics_probe/manifest.json --entry finger_spin_s200 \
+  --manifest logdir/dyn_recon/physics_probe/manifest.json --entry finger_spin_s200 \
   --seed 12345 --warmup 12 --steps 5 --atol 1e-9 \
-  --output logdir/physics_probe/finger_spin_s200_restore.json
+  --output logdir/dyn_recon/physics_probe/finger_spin_s200_restore.json
 ```
 
 在真实环境经过随机动作 warmup 后保存状态，将其恢复到另一环境，执行相同动作。
@@ -76,13 +97,42 @@ MUJOCO_GL=egl .venv/bin/python -m physics_probe restore-check \
 reset 默认值，工具拒绝该简化策略。完整快照不等于任意任务的完整环境；本实现只支持
 约定的四个固定模型任务，不支持随机地形或任意 model 修改。
 
+### 2a. 批量验证真实核心状态恢复
+
+`physics_probe.restore_experiment` 不加载世界模型或 decoder，只读取清单中的环境配置。
+先保存**未经过任何恢复的原始参考轨迹**，再在相同动作上比较三个恢复分支：
+
+- `full`：完整快照恢复，作为恢复接口的对照。
+- `core64`：真实 float64 `qpos/qvel/act`，其余字段使用上面的简化规则。
+- `core32`：核心状态先量化到 float32 再恢复，用于隔离数值精度影响，不代表 decoder 的误差。
+
+在共享服务器上，先明确一个可用 CPU 核 `PROBE_CPU`，使用单核、低优先级运行。
+下面是本次确认的诊断规模：四任务、5 个环境 seed、6 个起点、2 种动作保持时长，
+共 240 个起点，每种恢复方式最多续跑 50 个策略步。各任务实际的物理时间由其控制周期决定。
+
+```bash
+taskset -c "${PROBE_CPU:?请先指定一个可用CPU核}" nice -n 19 env \
+  MUJOCO_GL=egl CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python -m physics_probe.restore_experiment \
+  --manifest logdir/dyn_recon/physics_probe_dev/manifest.json \
+  --output logdir/dyn_recon/physics_probe_stage2_repeat \
+  --seeds 41000 41001 41002 41003 41004 \
+  --points 0 10 50 150 300 450 --holds 1 10 --horizon 50 --full-atol 1e-9
+```
+
+保存完整参考数据 `reference_*.pt`、逐起点/逐深度的 `metrics.jsonl`、每任务的
+`summary.json` 和总 `status.json`。到达真实 episode 终点即停止，不重置后继续比较。
+`full_atol` 仅检验完整恢复对照；`core_accepted` 仍为空，不擅自设定科学验收标准。
+恢复瞬间的触觉、IMU 等缓存观测与后续动力学应分别判读。同一轨迹上的多个起点相关，
+报告中的 p95 是描述性统计，不是独立样本置信区间。随机动作覆盖不能代替训练策略覆盖。
+
 ### 3. 从冻结模型采集配对数据
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe collect \
-  --manifest logdir/physics_probe/manifest.json --entry finger_spin_s200 \
+  --manifest logdir/dyn_recon/physics_probe/manifest.json --entry finger_spin_s200 \
   --seed 12345 --episodes 3 --max-steps 12 --device cuda:0 \
-  --output logdir/physics_probe/finger_spin_s200_data
+  --output logdir/dyn_recon/physics_probe/finger_spin_s200_data
 ```
 
 数据 seed 与模型 seed 分开；各 episode 使用 `seed + episode_id`。
@@ -109,8 +159,8 @@ snapshot 在当前观测时刻保存，action 在同一 feature 上采样。`max
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe fit \
-  --dataset logdir/physics_probe/finger_spin_s200_data \
-  --output logdir/physics_probe/finger_spin_s200_decoder \
+  --dataset logdir/dyn_recon/physics_probe/finger_spin_s200_data \
+  --output logdir/dyn_recon/physics_probe/finger_spin_s200_decoder \
   --source features --seed 17 --epochs 2 --hidden 32 --batch-size 8 --device cuda:0
 ```
 
@@ -121,6 +171,12 @@ CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe fit \
 按 episode 随机划分 train/validation/test；通常为 60/20/20，小数据至少各有一个 episode。
 只用训练数据拟合标准化统计，按 validation loss 保存最好模型，测试集不参与选择。
 `decoder.pt` 保存模型、标准化参数、分割、预算及数据清单 hash。
+新 checkpoint 同时记录 `dtype=float64`，训练报告记录 decoder/label dtype；加载时先按
+保存精度构造模型，避免 `load_state_dict` 隐式降精度。历史 float32 checkpoint 仍以
+float32 加载和评估，不把它冒充为 float64 训练结果。精度声明与实际张量不符时拒绝加载。
+新训练要求数据分片的原始 `cores` 为 float64，拒绝使用已量化为 float32 的标签。
+此次切换只改变计算精度，保留既有 loss 权重、标准化下限和近常量分量阈值；并不保证
+所有微小变化都能被学会，也不保证 float64 的解码准确度必然优于 float32。
 训练目前把选中 episode 的 feature/label 拼接到内存，不适合直接处理无限大的数据集。
 
 目标处理：
@@ -134,13 +190,81 @@ CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe fit \
 这是一版可解释的基线。某些任务的绝对位置不能由 proprio 唯一确定，可能限制该目标的
 可预测性；是否引入相对坐标需另行决定。不能以该基线失败直接判定 idea 不可行。
 
+### 4a. 第三步的独立预测评估
+
+`prediction-check` 只评估已保存的 test episodes，不启动任何物理恢复或续跑：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe prediction-check \
+  --dataset logdir/dyn_recon/physics_probe/finger_spin_s200_data \
+  --checkpoint logdir/dyn_recon/physics_probe/finger_spin_s200_decoder/decoder.pt \
+  --output logdir/dyn_recon/physics_probe/finger_spin_s200_prediction.json --device cuda:0
+```
+
+报告测试 loss、最佳验证轮次、原始逐坐标误差、周期校正后的非四元数 qpos 误差、
+四元数方向误差、qvel/act 误差，以及逐 episode 的统计。四元数单独计算方向误差，
+不把它们以零误差占位混进非四元数 qpos 的平均值。原始坐标误差仍包含角度绕圈和
+四元数符号等表示差异，不能独自用来判断物理恢复质量。
+
+### 4b. 已确认的第三步完整队列
+
+2026-11-04 确认：8 个模型各采集100个episode，每个最多500个策略步；各训练100轮，
+同时训练 feature 与 observation 对照，共16个独立decoder。网络和超参数沿用默认：
+两层256单元、batch=256、Adam lr=1e-3，float64。数据seeds为50000–50099，
+decoder训练及划分seed为17；每模型60/20/20个episode，两个输入对照共享完全相同的划分。
+
+队列顺序执行，不自动进入实验④⑤。每个阶段使用独立子进程，结束后释放内存。
+CPU必须绑定到单核并降低优先级；GPU仍限定6/7，以下限制PyTorch显存分配为2GiB
+（不包括CUDA上下文本身的占用）。
+
+```bash
+taskset -c "${PROBE_CPU:?请先指定一个可用CPU核}" nice -n 19 env \
+  CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python -u -m physics_probe.stage3 \
+  --manifest logdir/dyn_recon/physics_probe_dev/manifest.json \
+  --output logdir/dyn_recon/physics_probe_stage3_20261104 \
+  --episodes 100 --epochs 100 --max-steps 500 --observations \
+  --device cuda:0 --gpu-memory-gib 2 --data-seed 50000 --train-seed 17
+```
+
+输出根目录包含 `protocol.json`、固定模型清单、原子更新的 `status.json` 和逐阶段日志。
+各模型目录保存 `data/`、`features/`、`observations/` 和两个 `test_*.json`；
+每轮训练进度写入 `history.jsonl`。全部完成后自动生成 `summary.csv`、`summary.json`
+和 `REPORT.md`。异常会停止队列并记录失败，不自动反复重试。
+
+`--resume --output ...` 可跳过已完成且主要结果文件hash未变化的阶段；未完成输出和日志
+不会被覆盖或自动重训，需先检查。它不是从一次decoder训练中间恢复优化器的接口。
+
+运行期间可为尚未启动的模型增加辅助队列：
+
+```bash
+taskset -c "${PROBE_CPU:?请指定独立CPU核}" nice -n 19 env \
+  CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python -u -m physics_probe.parallel_entry \
+  --output logdir/dyn_recon/physics_probe_stage3_20261104 --entry walker_walk_s300
+```
+
+原队列与辅助队列通过 `.locks/` 下的逐阶段文件锁互斥；持锁后先校验已完成产物的模型身份、
+数据身份和预算，匹配时复用，不重复执行。未完成目录不会被覆盖。
+辅助队列使用独立 `parallel/<entry>/status.json` 和日志，原队列仍是根 `status.json`
+与最终报告的唯一写入者。根状态可能尚未推进到已由辅助队列完成的模型，应结合
+辅助状态或实际产物查看全局进度，不能简单累加两份状态中的阶段数。
+本轮经用户授权最多4个GPU6 worker，每个2GiB PyTorch显存、一个独立CPU核、nice=19；
+实际启动安排记录于输出目录的 `parallel_execution.json`。GPU利用率高时并行不保证线性加速。
+
+对新9模型清单，主队列使用 `--expected-models 9`，输出路径改为
+`logdir/dyn_recon/physics_probe_stage3_symlog_f64_20261105`。
+辅助队列可用 `--entries model_id_1 model_id_2` 在同一worker上顺序处理多个模型，
+不随模型数增加并发。此次仍最多4个worker，GPU6/7各最多2个；每worker独立CPU核、
+nice=19、2GiB PyTorch显存上限。其余训练超参数与首轮相同。
+
 ### 5. 测试 posterior 解码与真实续跑
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe evaluate \
-  --dataset logdir/physics_probe/finger_spin_s200_data \
-  --checkpoint logdir/physics_probe/finger_spin_s200_decoder/decoder.pt \
-  --output logdir/physics_probe/finger_spin_s200_posterior.json \
+  --dataset logdir/dyn_recon/physics_probe/finger_spin_s200_data \
+  --checkpoint logdir/dyn_recon/physics_probe/finger_spin_s200_decoder/decoder.pt \
+  --output logdir/dyn_recon/physics_probe/finger_spin_s200_posterior.json \
   --device cuda:0 --stride 6 --horizon 3 --max-starts 2
 ```
 
@@ -154,9 +278,9 @@ CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe evaluate 
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl .venv/bin/python -m physics_probe imagine-check \
-  --dataset logdir/physics_probe/finger_spin_s200_data \
-  --checkpoint logdir/physics_probe/finger_spin_s200_decoder/decoder.pt \
-  --output logdir/physics_probe/finger_spin_s200_imagination.json \
+  --dataset logdir/dyn_recon/physics_probe/finger_spin_s200_data \
+  --checkpoint logdir/dyn_recon/physics_probe/finger_spin_s200_decoder/decoder.pt \
+  --output logdir/dyn_recon/physics_probe/finger_spin_s200_imagination.json \
   --device cuda:0 --stride 6 --horizon 15 --max-starts 2
 ```
 

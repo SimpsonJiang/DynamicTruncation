@@ -55,30 +55,50 @@ class VectorLoggingTest(unittest.TestCase):
             with self.subTest(metric=metric):
                 self._check_trainer_routing(metric)
 
-    def _check_trainer_routing(self, metric):
+    def test_trainer_forwards_environment_steps_during_pretraining(self):
+        self._check_trainer_routing("imag_wasser", env_num=2, action_repeat=3, pretrain=3)
+
+    def _check_trainer_routing(self, metric, env_num=1, action_repeat=1, pretrain=1):
+        step_size = env_num * action_repeat
         config = OmegaConf.create(
             dict(
-                steps=4, pretrain=1, eval_every=0, eval_episode_num=0, video_pred_log=False,
-                params_hist_log=False, batch_length=1, batch_size=1, train_ratio=1,
-                update_log_every=1, action_repeat=1,
+                steps=4 * step_size,
+                pretrain=pretrain,
+                eval_every=0,
+                eval_episode_num=0,
+                video_pred_log=False,
+                params_hist_log=False,
+                batch_length=1,
+                batch_size=1,
+                train_ratio=1,
+                update_log_every=1,
+                action_repeat=action_repeat,
             )
         )
-        envs = mock.Mock(env_num=1)
-        trans = TensorDict({"reward": torch.zeros(1, 1)}, batch_size=(1,))
-        envs.step.side_effect = lambda action, done: (trans.clone(), torch.zeros(1, dtype=torch.bool))
+        envs = mock.Mock(env_num=env_num)
+        trans = TensorDict({"reward": torch.zeros(env_num, 1)}, batch_size=(env_num,))
+        envs.step.side_effect = lambda action, done: (trans.clone(), torch.zeros(env_num, dtype=torch.bool))
         state = TensorDict(
-            {"prev_action": torch.zeros(1, 1), "stoch": torch.zeros(1, 2, 2), "deter": torch.zeros(1, 4)},
-            batch_size=(1,),
+            {
+                "prev_action": torch.zeros(env_num, 1),
+                "stoch": torch.zeros(env_num, 2, 2),
+                "deter": torch.zeros(env_num, 4),
+            },
+            batch_size=(env_num,),
         )
         agent = mock.Mock(device=torch.device("cpu"))
         agent.get_initial_state.return_value = state
-        agent.act.return_value = (torch.zeros(1, 1), state)
+        agent.act.return_value = (torch.zeros(env_num, 1), state)
         agent.update.return_value = {metric: torch.tensor([[1.0], [2.0]]), "loss": torch.tensor(3.0)}
         replay = mock.Mock()
         replay.count.return_value = 0
         logger = mock.Mock()
         trainer = OnlineTrainer(config, replay, logger, None, envs, None)
         trainer.begin(agent)
+        self.assertEqual(
+            agent.update.call_args_list,
+            [mock.call(replay, env_step=3 * step_size)] * pretrain + [mock.call(replay, env_step=4 * step_size)],
+        )
         self.assertEqual(logger.vector.call_count, 2)
         for call in logger.vector.call_args_list:
             self.assertEqual(call.args[0], f"train/{metric}")

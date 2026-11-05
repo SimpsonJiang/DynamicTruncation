@@ -44,25 +44,33 @@ class StateCodec:
 
 
 class StateDecoder(nn.Module):
-    def __init__(self, input_dim, schema, hidden=256):
+    def __init__(self, input_dim, schema, hidden=256, dtype=torch.float64):
         super().__init__()
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError("Decoder supports float64 and legacy float32 checkpoints only")
         self.codec = StateCodec(schema)
         self.input_dim, self.hidden = input_dim, hidden
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+            nn.Linear(input_dim, hidden, dtype=dtype),
             nn.SiLU(),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden, hidden, dtype=dtype),
             nn.SiLU(),
-            nn.Linear(hidden, self.codec.dim),
+            nn.Linear(hidden, self.codec.dim, dtype=dtype),
         )
-        self.register_buffer("input_mean", torch.zeros(input_dim))
-        self.register_buffer("input_scale", torch.ones(input_dim))
-        self.register_buffer("target_mean", torch.zeros(self.codec.dim))
-        self.register_buffer("target_scale", torch.ones(self.codec.dim))
+        self.register_buffer("input_mean", torch.zeros(input_dim, dtype=dtype))
+        self.register_buffer("input_scale", torch.ones(input_dim, dtype=dtype))
+        self.register_buffer("target_mean", torch.zeros(self.codec.dim, dtype=dtype))
+        self.register_buffer("target_scale", torch.ones(self.codec.dim, dtype=dtype))
         self.register_buffer("active", torch.ones(self.codec.dim, dtype=torch.bool))
+
+    @property
+    def dtype(self):
+        return self.input_mean.dtype
 
     @torch.no_grad()
     def normalize_from_training(self, inputs, cores):
+        inputs = inputs.to(self.input_mean)
+        cores = cores.to(self.target_mean)
         target = self.codec.encode(cores)
         self.input_mean.copy_(inputs.mean(0))
         self.input_scale.copy_(inputs.std(0, unbiased=False).clamp_min(1e-3))
@@ -80,6 +88,8 @@ class StateDecoder(nn.Module):
                 self.target_mean[index], self.target_scale[index], self.active[index] = 0, 1, True
 
     def encoded_prediction(self, inputs):
+        # Frozen Dreamer keeps its own precision. Promote only at the decoder boundary.
+        inputs = inputs.to(self.input_mean)
         normalized = self.net((inputs - self.input_mean) / self.input_scale)
         normalized = normalized * self.active
         return normalized * self.target_scale + self.target_mean
@@ -89,7 +99,7 @@ class StateDecoder(nn.Module):
 
     def loss(self, inputs, cores):
         prediction = self.encoded_prediction(inputs)
-        target = self.codec.encode(cores)
+        target = self.codec.encode(cores.to(self.target_mean))
         squared = ((prediction - target) / self.target_scale).square()
         mask = self.active.clone()
         rotation_terms = []
@@ -118,6 +128,8 @@ class StateDecoder(nn.Module):
 
     def export(self):
         return {
+            "version": 2,
+            "dtype": str(self.dtype).removeprefix("torch."),
             "input_dim": self.input_dim,
             "hidden": self.hidden,
             "schema": self.codec.schema,
@@ -126,6 +138,15 @@ class StateDecoder(nn.Module):
 
     @classmethod
     def from_export(cls, exported, device="cpu"):
-        model = cls(exported["input_dim"], exported["schema"], exported["hidden"]).to(device)
+        # Construct in the stored dtype BEFORE load_state_dict, which otherwise
+        # silently casts saved double parameters into a float32 destination.
+        dtypes = {v.dtype for v in exported["state_dict"].values() if v.is_floating_point()}
+        if len(dtypes) != 1 or not dtypes.issubset({torch.float32, torch.float64}):
+            raise ValueError(f"Inconsistent or unsupported decoder checkpoint dtypes: {dtypes}")
+        dtype = next(iter(dtypes))
+        name = str(dtype).removeprefix("torch.")
+        if exported.get("dtype", name) != name:
+            raise ValueError("Decoder dtype metadata disagrees with saved tensors")
+        model = cls(exported["input_dim"], exported["schema"], exported["hidden"], dtype=dtype).to(device)
         model.load_state_dict(copy.deepcopy(exported["state_dict"]), strict=True)
         return model.eval()

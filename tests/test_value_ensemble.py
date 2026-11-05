@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 import truncation
-from distributions import TwoHot
+from distributions import TwoHot, symexp_twohot
 from dreamer import Dreamer
 from networks import MLPHead
 from truncation import cal_ens_uncertainty
@@ -57,16 +57,27 @@ class ValueEnsembleTest(unittest.TestCase):
         torch.manual_seed(17)
 
     def make_agent(
-        self, size=5, outscale=0.0, trunc_enabled=False, min_horizon=8, metric="wasser", beta=0.1, imag_horizon=3
+        self,
+        size=5,
+        outscale=0.0,
+        trunc_enabled=False,
+        min_horizon=8,
+        metric="wasser",
+        beta=0.1,
+        imag_horizon=3,
+        distance_space="raw",
+        warmup_steps=0,
     ):
         config = OmegaConf.create(self.config)
         config.value_ensemble_size = size
         config.uncer_metric = metric
+        config.distance_space = distance_space
         config.beta = beta
         config.imag_horizon = imag_horizon
         config.critic.outscale = outscale
         config.dynamic_trunc.enabled = trunc_enabled
         config.dynamic_trunc.min_horizon = min_horizon
+        config.dynamic_trunc.warmup_steps = warmup_steps
         with contextlib.redirect_stdout(io.StringIO()):
             agent = Dreamer(config, self.obs_space, self.act_space).to("cpu")
         # CPU unit tests must not depend on whether this host exposes CUDA.
@@ -108,8 +119,10 @@ class ValueEnsembleTest(unittest.TestCase):
         agent = self.make_agent()
         self.assertEqual(self.config["value_ensemble_size"], 5)
         self.assertEqual(self.config["uncer_metric"], "wasser")
+        self.assertEqual(self.config["distance_space"], "raw")
         self.assertEqual(self.config["beta"], 0.1)
         self.assertTrue(self.config["dynamic_trunc"]["enabled"])
+        self.assertEqual(self.config["dynamic_trunc"]["warmup_steps"], 50_000)
         self.assertEqual(len(agent.value), 5)
         reference = MLPHead(OmegaConf.create(self.config["critic"]), agent.rssm.feat_size)
         shapes = {name: param.shape for name, param in reference.named_parameters()}
@@ -143,24 +156,26 @@ class ValueEnsembleTest(unittest.TestCase):
                 self.make_agent(size=1, trunc_enabled=True, metric=metric)
 
     def test_invalid_uncertainty_configuration(self):
+        for warmup in (-1, 1.5, True, "1000000", None):
+            with self.subTest(warmup=warmup), self.assertRaisesRegex(ValueError, "warmup_steps"):
+                self.make_agent(warmup_steps=warmup)
         for metric in ("", "UCB", "unknown", None):
             with self.subTest(metric=metric), self.assertRaisesRegex(ValueError, "uncer_metric"):
                 self.make_agent(metric=metric)
         for beta in (-1, float("nan"), float("inf"), -float("inf")):
             with self.subTest(beta=beta), self.assertRaisesRegex(ValueError, "model.beta"):
                 self.make_agent(beta=beta)
+        for space in ("", "log", None, True):
+            with self.subTest(space=space), self.assertRaisesRegex(ValueError, "model.distance_space"):
+                self.make_agent(distance_space=space)
 
     def test_uncertainty_dispatcher_reads_only_selected_inputs_and_preserves_beta(self):
         values = torch.tensor([1.0, 3.0, 5.0]).reshape(3, 1, 1, 1).expand(-1, 2, 3, -1).requires_grad_()
         bins = torch.tensor([-3.0, -1.0, 4.0])
         dists = [TwoHot(prob.log().expand(2, 3, -1), bins) for prob in torch.eye(3)]
         torch.testing.assert_close(cal_ens_uncertainty(None, values, "ucb"), torch.full((2, 2, 1), 3.2))
-        torch.testing.assert_close(
-            cal_ens_uncertainty(None, values, "ucb", beta=2), torch.full((2, 2, 1), 7.0)
-        )
-        torch.testing.assert_close(
-            cal_ens_uncertainty(None, values, "sigma", beta=9), torch.full((2, 2, 1), 2.0)
-        )
+        torch.testing.assert_close(cal_ens_uncertainty(None, values, "ucb", beta=2), torch.full((2, 2, 1), 7.0))
+        torch.testing.assert_close(cal_ens_uncertainty(None, values, "sigma", beta=9), torch.full((2, 2, 1), 2.0))
         for metric in ("wasser", "cramer", "sqrt_cramer"):
             if metric == "wasser":
                 expected = truncation._imag_wasserstein(dists)
@@ -177,13 +192,11 @@ class ValueEnsembleTest(unittest.TestCase):
     def test_ucb_uses_sample_std_beta_and_retains_trajectory_and_time(self):
         agent = self.make_agent(metric="ucb", beta=2)
         # (heads, trajectories, H+1, 1); the final bootstrap predictions are deliberately extreme.
-        values = torch.tensor(
-            [
-                [[-1.0, 1.0, 100.0], [3.0, -3.0, 100.0]],
-                [[1.0, 3.0, -100.0], [3.0, -1.0, -100.0]],
-                [[3.0, 5.0, 500.0], [3.0, 1.0, 500.0]],
-            ]
-        ).unsqueeze(-1)
+        values = torch.tensor([
+            [[-1.0, 1.0, 100.0], [3.0, -3.0, 100.0]],
+            [[1.0, 3.0, -100.0], [3.0, -1.0, -100.0]],
+            [[3.0, 5.0, 500.0], [3.0, 1.0, 500.0]],
+        ]).unsqueeze(-1)
         expected = torch.tensor([[[5.0], [7.0]], [[3.0], [3.0]]])
         torch.testing.assert_close(truncation._imag_ucb(values, beta=agent.ucb_beta), expected)
         torch.testing.assert_close(
@@ -216,13 +229,15 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertIsNone(values.grad)
 
     def test_sigma_uses_sample_std_and_preserves_trajectory_and_depth(self):
-        values = torch.tensor(
-            [
+        values = (
+            torch.tensor([
                 [[-1.0, 1.0, 100.0], [3.0, -3.0, 100.0]],
                 [[1.0, 5.0, -100.0], [3.0, -1.0, -100.0]],
                 [[3.0, 9.0, 500.0], [3.0, 1.0, 500.0]],
-            ]
-        ).unsqueeze(-1).requires_grad_()
+            ])
+            .unsqueeze(-1)
+            .requires_grad_()
+        )
         expected = torch.tensor([[[2.0], [4.0]], [[0.0], [2.0]]])
         score = truncation._imag_sigma(values)
         torch.testing.assert_close(score, expected)
@@ -302,7 +317,9 @@ class ValueEnsembleTest(unittest.TestCase):
                 uncertainty.assert_called_once()
                 dists, all_values, selected_metric = uncertainty.call_args.args
                 self.assertEqual(selected_metric, metric)
-                self.assertEqual(uncertainty.call_args.kwargs, {"beta": agent.ucb_beta})
+                self.assertEqual(
+                    uncertainty.call_args.kwargs, {"beta": agent.ucb_beta, "distance_space": agent.distance_space}
+                )
                 self.assertEqual(len(dists), 5)
                 self.assertEqual(all_values.shape, (5, 8, horizon + 1, 1))
                 name = f"imag_{metric}"
@@ -326,7 +343,7 @@ class ValueEnsembleTest(unittest.TestCase):
                     sigma.assert_not_called()
                 if metric in ("cramer", "sqrt_cramer"):
                     cramer.assert_called_once()
-                    self.assertEqual(cramer.call_args.kwargs, {"take_sqrt": metric == "sqrt_cramer"})
+                    self.assertEqual(cramer.call_args.kwargs, {"take_sqrt": metric == "sqrt_cramer", "space": "raw"})
                     dists = cramer.call_args.args[0]
                     self.assertEqual(len(dists), 5)
                     self.assertEqual(dists[0].probs.shape[:2], (8, horizon + 1))
@@ -392,6 +409,63 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertIsNone(slow.grad)
         self.assertEqual(feat.grad[:, -1].abs().sum().item(), 0)
         self.assertEqual(feat.grad[0, 1].abs().sum().item(), 0)
+
+    def test_symlog_distances_weight_full_cdf_and_exclude_bootstrap(self):
+        # symlog coordinates are [-2, 0, 3]; half the mass moves across width 5.
+        bins = torch.tensor([-math.expm1(2), 0, math.expm1(3)], requires_grad=True)
+        left = torch.tensor([0.5, 0.5, 0.0]).log().expand(2, 4, -1).clone().requires_grad_()
+        right = torch.tensor([0.0, 0.5, 0.5]).log().expand(2, 4, -1).clone()
+        right[:, -1] = left.detach()[:, -1]  # Bootstrap disagreement must not enter the score.
+        right.requires_grad_()
+        for metric, expected in (("wasser", 2.5), ("cramer", 1.25), ("sqrt_cramer", math.sqrt(1.25))):
+            with self.subTest(metric=metric), torch.autocast(device_type="cpu", dtype=torch.float16):
+                dists = [TwoHot(logits, bins) for logits in (left, right)]
+                score = cal_ens_uncertainty(dists, None, metric, distance_space="symlog")
+                torch.testing.assert_close(score, torch.full((2, 3, 1), expected))
+                self.assertEqual(score.dtype, torch.float32)
+                self.assertFalse(score.requires_grad)
+                for identical in ([dists[0]], [dists[0]] * 5):
+                    torch.testing.assert_close(
+                        cal_ens_uncertainty(identical, None, metric, distance_space="symlog"),
+                        torch.zeros_like(score),
+                    )
+        for value in (bins, left, right):
+            self.assertIsNone(value.grad)
+
+    def test_symlog_distances_have_equal_spacing_at_center_and_tails(self):
+        # Use the actual critic distribution: 255 bins span symlog coordinates [-20, 20].
+        for index in (0, 126, 253):
+            logits = torch.full((2, 4, 255), -torch.inf)
+            logits[..., index] = 0
+            other = torch.full_like(logits, -torch.inf)
+            other[..., index + 1] = 0
+            dists = [symexp_twohot(x, 255) for x in (logits, other)]
+            for metric in ("wasser", "cramer", "sqrt_cramer"):
+                with self.subTest(index=index, metric=metric):
+                    expected = math.sqrt(40 / 254) if metric == "sqrt_cramer" else 40 / 254
+                    score = cal_ens_uncertainty(dists, None, metric, distance_space="symlog")
+                    torch.testing.assert_close(score, torch.full((2, 3, 1), expected))
+
+    def test_symlog_distance_reaches_training_threshold_and_logging(self):
+        for metric in ("wasser", "cramer", "sqrt_cramer"):
+            with self.subTest(metric=metric):
+                agent = self.make_agent(metric=metric, distance_space="symlog", trunc_enabled=True, outscale=0.1)
+                data, initial = self.make_batch(agent)
+                with mock.patch("dreamer.cal_ens_uncertainty", wraps=cal_ens_uncertainty) as uncertainty:
+                    _, metrics = agent._cal_grad(data, initial)
+                self.assertEqual(uncertainty.call_args.kwargs["distance_space"], "symlog")
+                score = cal_ens_uncertainty(*uncertainty.call_args.args, **uncertainty.call_args.kwargs)
+                torch.testing.assert_close(metrics[f"imag_{metric}"], score.mean(dim=0))
+                expected = torch.quantile(score[:, 0].reshape(-1), agent.dynamic_trunc_quantile)
+                torch.testing.assert_close(metrics["dynamic_trunc/threshold_raw"], expected)
+
+    def test_distance_space_does_not_affect_scalar_metrics(self):
+        values = torch.randn(5, 2, 4, 1)
+        for metric in ("ucb", "sigma"):
+            torch.testing.assert_close(
+                cal_ens_uncertainty(None, values, metric, distance_space="symlog"),
+                cal_ens_uncertainty(None, values, metric),
+            )
 
     def test_wasserstein_identical_and_point_mass_distributions(self):
         bins = torch.tensor([-3.0, -1.0, 4.0])
@@ -544,9 +618,7 @@ class ValueEnsembleTest(unittest.TestCase):
         self.assertNotAlmostEqual(root_mean, math.sqrt(6.2))
         for order in (dists, [dists[i] for i in [3, 0, 4, 1, 2]]):
             torch.testing.assert_close(truncation._imag_cramer(order), torch.full((2, 2, 1), 6.2))
-            torch.testing.assert_close(
-                truncation._imag_cramer(order, take_sqrt=True), torch.full((2, 2, 1), root_mean)
-            )
+            torch.testing.assert_close(truncation._imag_cramer(order, take_sqrt=True), torch.full((2, 2, 1), root_mean))
 
     def test_cramer_retains_trajectory_depth_and_excludes_bootstrap(self):
         bins = torch.tensor([-1.0, 3.0])
@@ -561,15 +633,12 @@ class ValueEnsembleTest(unittest.TestCase):
             torch.testing.assert_close(score.mean(dim=0), target.mean(dim=0))
             changed = probabilities.clone()
             changed[:, -1] = torch.tensor([1.0, 0.0])
-            torch.testing.assert_close(
-                truncation._imag_cramer([left, TwoHot(changed.log(), bins)], take_sqrt), target
-            )
+            torch.testing.assert_close(truncation._imag_cramer([left, TwoHot(changed.log(), bins)], take_sqrt), target)
 
     def test_cramer_is_detached_float32_under_autocast(self):
         bins = torch.tensor([-60000.0, 60000.0], dtype=torch.float16, requires_grad=True)
         logits = [
-            torch.tensor(v, dtype=torch.float16, requires_grad=True)
-            for v in ([0.0, -torch.inf], [-torch.inf, 0.0])
+            torch.tensor(v, dtype=torch.float16, requires_grad=True) for v in ([0.0, -torch.inf], [-torch.inf, 0.0])
         ]
         with torch.autocast(device_type="cpu", dtype=torch.float16):
             dists = [TwoHot(value.expand(2, 2, -1), bins) for value in logits]
@@ -629,6 +698,59 @@ class ValueEnsembleTest(unittest.TestCase):
                 for module in [agent.rssm._img_net, agent.reward, agent.cont, agent.decoder, agent._slow_value]:
                     self.assertEqual(self.grad_norm(module), 0)
                 self.assert_frozen_sharing(agent)
+
+    def test_warmup_preserves_full_horizon_losses_and_gradients(self):
+        agent = self.make_agent(trunc_enabled=True, min_horizon=1, warmup_steps=1_000_000, outscale=0.1)
+        baseline = self.make_agent(trunc_enabled=False, outscale=0.1)
+        baseline.load_state_dict({k: v for k, v in agent.state_dict().items() if not k.startswith("trunc_kappa.")})
+        data, initial = self.make_batch(agent)
+        scores = torch.tensor([1.0, 10.0, 10.0]).reshape(1, 3, 1).expand(8, -1, -1)
+        rng = torch.get_rng_state()
+        with mock.patch("dreamer.cal_ens_uncertainty", return_value=scores):
+            _, metrics = agent._cal_grad(data, initial)
+            torch.set_rng_state(rng)
+            _, reference = baseline._cal_grad(data, initial)
+        for name, value in reference.items():
+            torch.testing.assert_close(metrics[name], value, rtol=0, atol=0)
+        for name, param in agent._named_params.items():
+            other = baseline._named_params[name]
+            if param.grad is None:
+                self.assertIsNone(other.grad)
+            else:
+                torch.testing.assert_close(param.grad, other.grad, rtol=0, atol=0)
+        self.assertEqual(metrics["dynamic_trunc/active"].item(), 0)
+        self.assertEqual(metrics["dynamic_trunc/keep_rate"].item(), 1)
+        self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 3)
+        self.assertTrue(agent.trunc_kappa.initialized)
+        self.assertEqual(agent.trunc_kappa.value.item(), 1)
+
+    def test_warmup_switches_at_environment_step_boundary(self):
+        agent = self.make_agent(trunc_enabled=True, min_horizon=1, warmup_steps=50_000)
+        data, initial = self.make_batch(agent)
+        replay = mock.Mock()
+        replay.sample.side_effect = lambda: (data.clone(), "indices", initial)
+        scores = torch.tensor([1.0, 10.0, 10.0]).reshape(1, 3, 1).expand(8, -1, -1)
+        for step, active in ((49_999, False), (49_999, False), (50_000, True), (50_001, True)):
+            with (
+                self.subTest(step=step, active=active),
+                mock.patch("dreamer.cal_ens_uncertainty", return_value=scores),
+                mock.patch.object(agent, "_cal_grad", wraps=agent._cal_grad) as cal_grad,
+            ):
+                metrics = agent.update(replay, env_step=step)
+                self.assertEqual(cal_grad.call_args.kwargs, {"truncation_active": active})
+                self.assertEqual(metrics["dynamic_trunc/active"].item(), float(active))
+                self.assertEqual(metrics["dynamic_trunc/effective_horizon"].item(), 1 if active else 3)
+                torch.testing.assert_close(metrics["dynamic_trunc/keep_rate"], torch.tensor(1 / 3 if active else 1.0))
+
+    def test_disabled_truncation_stays_disabled_after_warmup(self):
+        agent = self.make_agent(trunc_enabled=False, warmup_steps=1_000_000)
+        data, initial = self.make_batch(agent)
+        replay = mock.Mock()
+        replay.sample.return_value = data, "indices", initial
+        with mock.patch.object(agent, "_cal_grad", wraps=agent._cal_grad) as cal_grad:
+            metrics = agent.update(replay, env_step=2_000_000)
+        self.assertFalse(cal_grad.call_args.kwargs["truncation_active"])
+        self.assertFalse(any(key.startswith("dynamic_trunc/") for key in metrics))
 
     def test_dynamic_threshold_curve_masks_and_return_normalization(self):
         for metric in SCORE_METHODS:

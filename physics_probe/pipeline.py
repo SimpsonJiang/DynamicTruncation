@@ -1,6 +1,7 @@
 """Explicit-budget data collection, supervised fitting, and paired simulation checks."""
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,7 @@ def collect(entry, output, seed, episodes, max_steps, device):
         agent = load_agent(entry, env, device)
         records = []
         for episode in range(episodes):
+            episode_started = time.monotonic()
             # Independent reset seeds; no overlap with earlier episode seeds.
             if episode:
                 env.close()
@@ -144,8 +146,13 @@ def collect(entry, output, seed, episodes, max_steps, device):
                 "episode_seed": seed + episode,
                 "samples": len(features),
                 "complete_episode": shard["complete_episode"],
+                "elapsed_seconds": time.monotonic() - episode_started,
             })
-            print(f"Collected {entry['id']} episode {episode}: {len(features)} states", flush=True)
+            print(
+                f"Collected {entry['id']} episode {episode}: {len(features)} states, "
+                f"{records[-1]['elapsed_seconds']:.1f}s",
+                flush=True,
+            )
         meta = {
             "version": 1,
             "entry": entry,
@@ -156,6 +163,10 @@ def collect(entry, output, seed, episodes, max_steps, device):
             "device": device,
             "obs_keys": sorted(env.observation_space.spaces),
             "policy": "stochastic frozen actor",
+            "feature_dtype": str(shard["features"].dtype),
+            "label_dtype": str(shard["cores"].dtype),
+            "frozen_parameter_dtypes": sorted({str(p.dtype) for p in agent.parameters()}),
+            "frozen_trainable_parameters": sum(p.numel() for p in agent.parameters() if p.requires_grad),
             "alignment": "feature/state at t, action at t produces next observation; no physics labels in encoder",
             "provenance": provenance(),
         }
@@ -191,7 +202,15 @@ def episode_split(meta, seed):
 
 def arrays(path, meta, ids, source):
     shards = [load_shard(path, meta["episodes"][i]) for i in ids]
-    return torch.cat([s[source] for s in shards]).float(), torch.cat([s["cores"] for s in shards]).float()
+    if any(s["cores"].dtype != torch.float64 for s in shards):
+        raise ValueError(
+            "float64 decoder training requires original float64 core labels; recasting cannot recover precision"
+        )
+    # Preserve simulator label precision; never round via float32 first.
+    return (
+        torch.cat([s[source] for s in shards]).to(torch.float64),
+        torch.cat([s["cores"] for s in shards]).to(torch.float64),
+    )
 
 
 def fit(dataset, output, source, seed, epochs, batch_size, hidden, lr, device):
@@ -202,7 +221,7 @@ def fit(dataset, output, source, seed, epochs, batch_size, hidden, lr, device):
     torch.manual_seed(seed)
     x, y = arrays(path, meta, split["train"], source)
     vx, vy = arrays(path, meta, split["validation"], source)
-    model = StateDecoder(x.shape[-1], meta["schema"], hidden).to(device)
+    model = StateDecoder(x.shape[-1], meta["schema"], hidden, dtype=torch.float64).to(device)
     model.normalize_from_training(x.to(device), y.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     generator = torch.Generator().manual_seed(seed)
@@ -225,14 +244,18 @@ def fit(dataset, output, source, seed, epochs, batch_size, hidden, lr, device):
                 for a, b in zip(vx.split(batch_size), vy.split(batch_size))
             ) / len(vx)
         history.append({"epoch": epoch + 1, "train_loss": total / len(x), "validation_loss": validation})
+        with (output / "history.jsonl").open("a") as f:
+            f.write(json.dumps(history[-1], allow_nan=False) + "\n")
         if validation < best:
             best, best_export = validation, model.export()
         print(history[-1], flush=True)
     if best_export is None:
         raise RuntimeError("No finite validation checkpoint")
     result = {
-        "version": 1,
+        "version": 2,
         "model": best_export,
+        "decoder_dtype": str(model.dtype).removeprefix("torch."),
+        "label_dtype": str(y.dtype).removeprefix("torch."),
         "entry": meta["entry"],
         "source": source,
         "provenance": provenance(),
@@ -279,7 +302,7 @@ def evaluate(dataset, checkpoint, output, device, stride, horizon, max_starts):
     starts = 0
     for episode in saved["split"]["test"]:
         shard = load_shard(path, meta["episodes"][episode])
-        inputs = shard[saved["source"]].float()
+        inputs = shard[saved["source"]].to(dtype=model.dtype)
         predictions = torch.cat([model(x.to(device)).cpu() for x in inputs.split(512)]).numpy()
         for prediction, target in zip(predictions, shard["cores"].numpy()):
             rows.append(state_errors(prediction, target, meta["schema"]))
@@ -316,6 +339,7 @@ def evaluate(dataset, checkpoint, output, device, stride, horizon, max_starts):
         "decoder_sha256": sha256(checkpoint),
         "provenance": provenance(),
         "source": saved["source"],
+        "decoder_dtype": str(model.dtype).removeprefix("torch."),
         "test_episodes": saved["split"]["test"],
         "state_metrics": statistics(rows),
         "restore_attempts": starts,
@@ -433,6 +457,7 @@ def imagine_check(dataset, checkpoint, output, device, stride, horizon, max_star
     report = {
         "entry": meta["entry"],
         "kind": "imagination_decode",
+        "decoder_dtype": str(decoder.dtype).removeprefix("torch."),
         "decoder_sha256": sha256(checkpoint),
         "provenance": provenance(),
         "horizon": horizon,
