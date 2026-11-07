@@ -88,7 +88,8 @@ Decoder 为两层 256 单元 SiLU MLP，Adam lr=1e-3，loss scale=1，梯度范�
 ## 分支与 replay
 
 - `is_branch` 只标分支根；`is_recon` 标整个片段。
-- 根 latent 单独保存在 `branch_stoch/branch_deter`，不被 replay latent 回写覆盖。
+- 根 latent 复用 replay 的 `stoch/deter`，由 `is_branch` 标记并禁止 latent 回写覆盖。
+  采样时仅为当前 batch 构造 `branch_stoch/branch_deter`，保持 RSSM 接口不变。
 - RSSM 在窗口任意位置遇到根时直接读取 seed，不对根执行 obs_step；普通 is_first 仍清零。
 - 首动作使用候选动作；真实下一观测到达后，当前策略 posterior 闭环采样。
 - 根的虚构入边、占位奖励、观测/KL/物理标签监督被屏蔽；根之后的真实转移仍训练。
@@ -143,9 +144,10 @@ PYTHONPATH=. .venv/bin/python tests/smoke_online_reconstruction.py
 接线测试用真实核心状态作为恢复成功路径的 oracle fixture；生产代码始终调用 learned decoder。
 测试通过不等于重建精度或探索收益通过，正式精度、阈值误拒率与收益仍需实际训练评估。
 
-首版 `branch_stoch/branch_deter` 使用 replay 的稠密字段。默认 size12M、50万行时，
-这部分额外存储约4.77 GiB（与原 stoch/deter 缓存同量级），另有 float64 标签/上下文；
-只开启 decoder 而关闭重建时不分配这些种子字段。
+replay 仅保留原有一份 `stoch/deter`，普通位置是可更新缓存，分支根是不可更新种子。
+相比首版重复存储，默认 size12M、50万行、float32 latent 时减少约4.77 GiB常驻显存。
+当前 batch 的分支种子张量仍有小量临时开销，float64 标签/上下文保持不变。
+修改仅对新启动进程生效，不会释放正在运行的旧进程已分配的存储。
 
 
 ## 模块接口与兼容性

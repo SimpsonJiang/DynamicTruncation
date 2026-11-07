@@ -104,8 +104,6 @@ class SafetyAndReplayTest(CPUContractTest):
                     episode=torch.zeros(1, dtype=torch.int32),
                     stoch=torch.full((1, 2, 2), float(t)),
                     deter=torch.full((1, 3), float(t)),
-                    branch_stoch=torch.full((1, 2, 2), 99.0),
-                    branch_deter=torch.full((1, 3), 99.0),
                     is_branch=torch.tensor([[branch]]),
                     action=torch.tensor([[float(t)]]),
                 ),

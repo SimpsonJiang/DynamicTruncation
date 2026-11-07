@@ -286,10 +286,9 @@ class ReconstructionController:
         candidates = [self.active_candidates[i] for i in root.nonzero().flatten().tolist()]
         features = np.stack([c.feature for c in candidates]) if candidates else None
         actions = np.stack([c.actions[c.depth] for c in candidates]) if candidates else None
-        action, result = self.agent.act_with_seeds(trans, state, features, actions)
-        trans["branch_stoch"] = torch.where(root[:, None, None], result["stoch"], 0).detach()
-        trans["branch_deter"] = torch.where(root[:, None], result["deter"], 0).detach()
-        return action, result
+        # The trainer stores these seeds in the regular stoch/deter fields.
+        # Replay protects branch roots from subsequent posterior cache updates.
+        return self.agent.act_with_seeds(trans, state, features, actions)
 
     def record(self, trans, done):
         self.replay.add_transition(trans.detach())

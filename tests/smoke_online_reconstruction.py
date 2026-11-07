@@ -168,6 +168,10 @@ def main():
             controller.record(trans, done)
         assert controller.stats["committed_branches"] == 1, controller.metrics()
         assert not replay.has_pending()
+        stored = replay._buffer.storage[:]
+        assert "branch_stoch" not in stored.keys() and "branch_deter" not in stored.keys()
+        roots = stored["is_branch"].squeeze(-1)
+        root_seeds = {key: stored[key][roots].clone() for key in ("stoch", "deter")}
         for _ in range(100):
             batch = replay.sample()
             if batch[0]["is_branch"].any():
@@ -186,6 +190,8 @@ def main():
             assert agent.reconstruction_candidates is not None
             controller.ingest()
         assert int(agent.physics_head.norm_updates) == updates
+        for key, seed in root_seeds.items():
+            torch.testing.assert_close(replay._buffer.storage[:][key][roots], seed, rtol=0, atol=0)
         controller.close()
         output = Path(args.output)
         output.mkdir(parents=True, exist_ok=True)

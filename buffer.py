@@ -110,14 +110,17 @@ class Buffer:
         elif src_dev != self.device:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
+        # At branch roots these are immutable seeds; update() skips those rows.
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
-        if self.transactional:
-            root = sample_td["is_branch"][:, 0]
-            initial = tuple(
-                torch.where(root.reshape(-1, *([1] * (x.ndim - 1))), sample_td[key][:, 0], x)
-                for x, key in zip(initial, ("branch_stoch", "branch_deter"))
-            )
         data = sample_td[:, 1:]
+        if self.transactional:
+            # Keep the RSSM batch interface without storing a second dense latent
+            # cache. Ordinary rows carry no branch seed, as before.
+            root = data["is_branch"]
+            for key in ("stoch", "deter"):
+                latent = data[key]
+                mask = root.reshape(*data.batch_size, *([1] * (latent.ndim - data.ndim)))
+                data["branch_" + key] = torch.where(mask, latent, 0)
         data.set_("action", sample_td["action"][:, :-1].clone())  # action is 1 step back
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
         return data, index, initial
