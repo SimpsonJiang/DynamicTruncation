@@ -277,7 +277,7 @@ env CUDA_VISIBLE_DEVICES='' MUJOCO_GL=egl OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OP
   --cpus "${PROBE_CPU:?请先检查CPU负载并指定一个可用核}"
 ```
 
-入口最多允许两个独立CPU worker，默认不隐式选择CPU；负载高时可使用上面的单核配置。
+入口最多允许六个独立CPU worker，默认不隐式选择CPU；负载高时可使用上面的单核配置。
 本次按用户允许的并行方式运行两个单核 worker（CPU 69、89），nice=19、每worker单线程。
 GPU6允许使用，但本次每个episode只推理6个起点，实际执行选择CPU，无GPU分配。
 它在输出目录创建源码快照，再从快照运行各模型；不覆盖已有输出，不自动重试失败任务。
@@ -394,3 +394,101 @@ EGL显式绑定 `MUJOCO_EGL_DEVICE_ID=6`，CUDA也限定6。队列使用源码�
 `physics_probe.vision_campaign` 自动串联采集/训练、续跑、渲染。任一阶段失败会记录错误并停止后续阶段，
 不会覆盖已有数据或自动重试；没有启用想象feature测试，也没有将恢复采样接入Dreamer训练。
 正式启动前的 `vision_smoke` 只运行3个短episode和2轮训练，用于集成验证，不作为科学结果。
+
+## 2026-11-06：CQ步骤④与三组步骤⑤
+
+用户确认：`CQ_wasser_symlog_advpositive_only_f64_H15` 的9个proprio模型（finger/hopper/quadruped，
+seeds1/42/100）先按每模型100个episode、100轮训练补齐feature/proprio两个float64 decoder，
+执行与前轮相同的步骤④（20个测试episode×6起点×50步），并保存3张任务汇总图。
+CQ虽然保存的配置中`value_ensemble_size=5`，实际构造的是categorical+quantile两个critic；严格加载已验证。
+
+随后，对CQ9个、`VE_wasser_symlog_f64_H15`的9个proprio和`VE_wasser_H15`的12个vision模型进行步骤⑤。
+旧两组复用已完成的feature decoder与测试集。新的冻结推理已与其原源码快照比较：全部21模型的
+想象features/actions、reward/continue和critic标量输出逐值一致，原checkpoint不做精度转换或再训练。
+
+步骤⑤协议：
+
+- 每模型20个测试episode，各取0/100/200/300/400/450策略步，共3600个真实起点。
+- 起点posterior为`f(0)`，生成H=15的完整想象轨迹；`f(d)`经过d个prior转移，使用动作`a(0)..a(d-1)`。
+- 在d=8/10/12/14分别解码`f(d)`并恢复，再执行同一个`a(d)`，只续跑1个策略步。
+  图片是`t+d+1`，明确标注`FEATURE: imag +d`、`RESTORE +1`及绝对策略步。
+- 参考环境从真实起点执行相同的想象动作，不使用原采集轨迹的未来动作。
+  对照为该参考环境在`t+d`时的真实核心状态恢复；没有obs/image→state对照，也没有posterior反馈。
+- 每种恢复方式共14400条一步分支。报告恢复瞬间和接续后的状态、proprio、奖励、终止、时间误差；
+  vision另报RGB/255的图像误差，绝不与proprio混成一个RMSE。
+- 按保存的`trunc_kappa`和`adv_scale`计算诊断截断边界，使用原配置raw/symlog和CQ positive-only规则；
+  两个EMA保持不变。固定深度可以超过该诊断边界，仍评估并标注；不等于重放训练时的在线EMA/暖启动过程。
+- `latent_next_*`比较`F(D(f(d)),a(d))`与`D(f(d+1))`，只表示内部一致性，不能当作真实状态精度。
+- 运行异常、参考失败和各深度有效样本数分别保存，不用低loss或“能跑完”当作科学验收。
+
+图片只保存汇总：CQ步骤④3张；步骤⑤共10张“实验组×任务”图，每张含三个seed×四个想象步。
+每个单元左侧是想象feature解码恢复，右侧是真实核心状态恢复，均拍执行同一动作后的第一帧。
+示例固定使用首个测试episode、第100步起点，不按误差选择；共享相机覆盖两种恢复状态，保留实际位置差异。
+图像直接渲染评估中保存的接续后snapshot，不重新采样想象动作。
+
+入口为`physics_probe.reconstruction_campaign`，所有工作按“CQ采集/训练→CQ④和图片→三组⑤和图片”自动串联。
+GPU只用6，初始4个worker，CPU82/83/81/73各绑定1核，nice=19、PyTorch线程1、每worker2GiB显存上限。
+创建独立源码快照后运行；失败会记录状态并停止后续步骤，不覆盖既有实验。
+
+- 总队列：`logdir/dyn_recon/physics_probe_cq_stage45_20261106/status.json`。
+- 预检：`logdir/dyn_recon/physics_probe_cq_stage45_20261106_preflight/`，含30模型检查、历史推理fixture及小规模集成检查。
+- CQ采集/训练：`logdir/dyn_recon/physics_probe_stage3_cq_positive_20261106/`。
+- CQ步骤④：`logdir/dyn_recon/physics_probe_stage4_cq_positive_20261106/`。
+- 三组步骤⑤：`logdir/dyn_recon/physics_probe_stage5_three_groups_20261106/`，含总报告/CSV、逐模型metrics和traces。
+  `traces.pt`保存每个起点的随机种子、想象features/actions、解码状态和截断诊断；`example.pt`保存图示状态。
+
+### CQ步骤④的相机展示修订（2026-11-07）
+
+用户确认将当前CQ步骤④的3张图改为“统一概览＋居中近景”。旧图每个模型根据三种恢复状态
+的联合包围范围调整相机距离，因此同任务不同seed之间物体大小变化明显；同一行三栏原本已共享相机。
+
+现在概览对同一任务的全部seed和分支固定同一相机；近景按各状态身体包围框平移相机居中，
+但同任务的方向、距离、视场和尺度固定，既不平移物理状态，也不旋转/对齐身体姿态。
+绝对位置需看概览及坐标标注，不能从居中近景判断。源episode、动作及第1步状态保持不变。
+
+入口 `physics_probe/render_restoration_views.py` 直接作为脚本运行，导入原步骤④源码快照中的
+环境与decoder，而非可能已修改的工作区模型。逐项核对原误差，并检查渲染前后integration state完全一致。
+输出在临时目录审阅后替换原`first_step_images/`中的3张PNG；保留`manifest_original.json`作为旧取景元数据，
+不另存旧PNG。数值报告和CSV不重算、不修改。该修订仅应用于CQ步骤④，其他实验图片不变。
+
+### 步骤⑤重建图语义修订（2026-11-07）
+
+用户明确要求图像展示想象feature经过原生image/proprio decoder得到的结果，并确认不执行接续动作、
+不放入真实仿真参考列。新的图像与此前“feature→核心状态decoder→恢复后接续1步”的数值诊断不同。
+原步骤⑤的REPORT/CSV/metrics保持不变，不能将旧误差数值套到这批新图上。
+
+- 直接读取既有`traces.pt`中的f(8)/f(10)/f(12)/f(14)，不重新想象，不重放真实动作。
+- 按RSSM真实拼接顺序拆回stoch/deter，逐值核对拼回的feature，再调用checkpoint中的原生`agent.decoder`取mode。
+- Vision：直接使用64×64 RGB输出，仅做最近邻放大；不经物理状态decoder，也不使用仿真器生成这些像素。
+- Proprio：原生decoder输出自然单位的观测，再经过该模型已训练的observation→核心状态decoder，恢复后立即渲染。
+  用户确认这一两级decoder链路；图中包括第二个decoder的误差，proprio本身不是完整物理状态。
+- Proprio辅助时间及上一control根据已知起点和保存的想象动作解析设置；只调用forward/render，环境step被禁止。
+  冻结Dreamer仍保持float32，observation→core映射及恢复状态保持float64。
+- 示例仍为episode60、posterior起点100，显示的是108/110/112/114步；没有恢复后的额外动作。
+
+新图集为步骤⑤目录下`native_decoder_images/`，仅10张“实验组×任务”汇总PNG。
+原生图集作为独立展示保留，不替代feature→物理状态→仿真主线。旧绘图元数据保留作记录。
+`native_observations.pt`保存原生输出和对应feature，`proprio_mapping_states.pt`保存两级映射后的核心状态。
+`export_native_observations.py`和`render_native_observations.py`作为独立脚本运行，导入步骤⑤归档源码。
+后续总队列使用`stage5_report --skip-images`先保存原数值诊断，再分别生成原生decoder图与物理状态重建图。
+
+### 步骤⑤的物理状态重建主线（2026-11-07）
+
+主图集为`physics_reconstruction_images/`：三个实验组的30模型，共10张任务汇总图。
+各行对应模型seed，各列对应想象第8/10/12/14步。Vision和proprio模型均直接使用
+`feature → 已训练的feature-to-core decoder → qpos/qvel/act → 仿真恢复 → 立即截图`。
+原生image/proprio decoder图继续单独保存在`native_decoder_images/`，二者不能互相替代。
+
+入口`physics_probe/render_physics_reconstructions.py`读取原步骤⑤保存的float64解码状态，
+核对原decoder权重和trace哈希、重新计算所选四个feature的输出，并验证与原生图集的feature逐值一致。
+仅解析设置已知时间和上一control；禁止环境step，渲染前后integration state必须完全一致。
+这组图显示`t+d`的恢复瞬间，原REPORT/CSV仍是`t+d+1`的一步接续诊断，二者时间点不同。
+`physical_states.pt`保存图示feature、预测核心状态和恢复snapshot，便于复查。
+
+### 步骤⑤并排对比入口
+
+最终对比图放在`comparison_images/README.md`：10张任务汇总图，每张三行seed、四组想象步
+（8/10/12/14），每组左侧是feature→物理状态→仿真，右侧是原生decoder链路。
+`compare_reconstruction_images.py`核对左右feature逐值相等，再将两套图的320×320原始像素并排排列，
+不重采样、不改变物理状态或相机。Vision右侧直接显示原生RGB；proprio右侧仍含observation→state映射。
+同时保留两套独立图作为来源，但查看对比应使用这个共同入口。

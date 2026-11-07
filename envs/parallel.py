@@ -13,11 +13,14 @@ from tensordict import TensorDict
 
 import tools
 
+from .physics_protocol import EnvStepResult
+
 
 class ParallelEnv:
-    def __init__(self, constructor, env_num, device):
+    def __init__(self, constructor, env_num, device, *, physics=False):
         self.envs = [Parallel(constructor(i), "process") for i in range(env_num)]
         self.device = device
+        self.physics_enabled = physics
 
     @property
     def observation_space(self):
@@ -32,7 +35,7 @@ class ParallelEnv:
         return len(self.envs)
 
     def lift_dim(self, td):
-        for key in td.keys():
+        for key in td.keys(include_nested=True, leaves_only=True):
             if td[key].ndim == 1:
                 td[key] = td[key].unsqueeze(-1)
         return td
@@ -52,29 +55,62 @@ class ParallelEnv:
         # Ensure inputs are on CPU for worker processes.
         action_np = tools.to_np(action)  # handles any device via .detach().cpu().numpy()
         done = done.cpu() if done.is_cuda else done
+        if self.physics_enabled:
+            return self.online_step(action_np, done)
         promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, action_np, done)]
-        new_o, new_r, new_d = [], [], []
-        for p, d in zip(promise, done):
-            if d:
-                new_o.append(p())
-                new_r.append(0.0)
-                new_d.append(False)
+        rows = []
+        for result, reset in zip(promise, done):
+            if reset:
+                rows.append(EnvStepResult(result(), 0.0, False))
             else:
-                o, r, d, _ = p()
-                new_o.append(o)
-                new_r.append(r)
-                new_d.append(d)
-        obs_stacked = {k: np.stack([o[k] for o in new_o]) for k in new_o[0].keys()}
+                obs, reward, finished, _ = result()
+                rows.append(EnvStepResult(obs, reward, finished))
+        return self._pack_steps(rows)
 
-        # Build CPU tensors first to avoid implicit GPU syncs and enable async H2D in caller.
-        obs_tensors = {k: torch.as_tensor(v, device="cpu") for k, v in obs_stacked.items()}
-        rew_stacked = torch.as_tensor(new_r, dtype=torch.float32, device="cpu")
+    def _pack_steps(self, rows):
+        """One dtype/device/shape boundary for ordinary, labelled and restored steps."""
+        obs = {
+            key: torch.as_tensor(np.stack([row.observation[key] for row in rows]), device="cpu")
+            for key in rows[0].observation
+        }
+        obs["reward"] = torch.tensor([row.reward for row in rows], dtype=torch.float32, device="cpu")
+        if rows[0].core is not None:
+            obs["physics"] = {"core": torch.as_tensor(np.stack([row.core for row in rows]), device="cpu")}
+            if rows[0].context_vector is not None:
+                obs["physics"]["context"] = torch.as_tensor(
+                    np.stack([row.context_vector for row in rows]), device="cpu"
+                )
+        td = TensorDict(obs, batch_size=(self.env_num,), device="cpu")
+        if torch.device(self.device).type == "cuda":
+            td = td.pin_memory()
+        return self.lift_dim(td), torch.tensor([row.done for row in rows], dtype=torch.bool, device="cpu")
 
-        # Keep data on CPU; caller will .to(device, non_blocking=True) after pinning.
-        # TensorDict batch size is (B,).
-        td = TensorDict({**obs_tensors, "reward": rew_stacked}, batch_size=(self.env_num,), device="cpu").pin_memory()
-        done = torch.as_tensor(new_d, device="cpu")
-        return self.lift_dim(td), done
+    def physics_schema(self):
+        return self.envs[0].physics_schema()()
+
+    def online_step(self, action_np, done):
+        promises = [e.online_step(a, bool(d)) for e, a, d in zip(self.envs, action_np, done)]
+        return self._pack_steps([p() for p in promises])
+
+    def setup_reconstruction(self):
+        profiles = [p() for p in [e.setup_guard() for e in self.envs]]
+        signatures = {p.get("signature") for p in profiles}
+        failure = next((p["failure"] for p in profiles if p.get("failure")), None)
+        if len(signatures) != 1:
+            failure = "slot_geometry_mismatch"
+        profile = profiles[0]
+        if failure:
+            profile["failure"] = failure
+        return profile
+
+    def reconstruction_step(self, actions, done, requests, phase, thresholds=None):
+        promises = [
+            e.reconstruction_step(a, bool(d), r, phase, thresholds)
+            for e, a, d, r in zip(self.envs, tools.to_np(actions), done.cpu(), requests)
+        ]
+        rows = [p() for p in promises]
+        trans, done = self._pack_steps(rows)
+        return trans, done, [row.report for row in rows], [row.context for row in rows]
 
 
 class Parallel:

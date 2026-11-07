@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 import torch
 
 import tools
+from buffer import ReplayNotReady
 
 
 class OnlineTrainer:
@@ -23,6 +27,21 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        self.reconstruction_config = config.get("reconstruction", {})
+        self.logdir = logdir
+        self._reconstruction_status = None
+
+    def write_reconstruction_diagnostics(self, reconstruction, *, final=False):
+        """Persist diagnostics at the training boundary, not inside environment stepping."""
+        directory = Path(self.logdir)
+        directory.mkdir(parents=True, exist_ok=True)
+        status = reconstruction.guard_status
+        if status != self._reconstruction_status:
+            (directory / "reconstruction_guard.json").write_text(json.dumps(reconstruction.guard_profile(), indent=2))
+            print("Reconstruction guard:", status, flush=True)
+            self._reconstruction_status = status
+        if final:
+            (directory / "reconstruction_summary.json").write_text(json.dumps(reconstruction.metrics(), indent=2))
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -106,12 +125,21 @@ class OnlineTrainer:
         ``.to()`` is a no-op when the data is already on the target device.
         """
         envs = self.train_envs
+        reconstruction = None
+        if self.reconstruction_config.get("enabled", False):
+            from reconstruction import ReconstructionController
+
+            reconstruction = ReconstructionController(
+                self.reconstruction_config, envs, self.replay_buffer, agent, self._action_repeat
+            )
+        update_credit = 0
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
         update_count = 0
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
+        episode_is_recon = torch.zeros(envs.env_num, dtype=torch.bool, device=agent.device)
         lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
@@ -132,8 +160,11 @@ class OnlineTrainer:
                             video = torch.stack(video_cache, axis=0)
                             self.logger.video("train_video", tools.to_np(video[None]))
                             video_cache = []
-                        self.logger.scalar("episode/score", returns[i])
-                        self.logger.scalar("episode/length", lengths[i])
+                        namespace = "episode"
+                        if reconstruction is not None and bool(episode_is_recon[i]):
+                            namespace = "reconstruction_episode"
+                        self.logger.scalar(f"{namespace}/score", returns[i])
+                        self.logger.scalar(f"{namespace}/length", lengths[i])
                         self.logger.write(step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
             step += int((~done).sum()) * self._action_repeat  # step is based on env side
@@ -144,7 +175,16 @@ class OnlineTrainer:
             # on GPU).  The .to() calls below are no-ops when the data is
             # already on agent.device.
             # (B, A), (B,)
-            trans, step_done = envs.step(act.detach(), done)
+            if reconstruction is None:
+                trans, step_done = envs.step(act.detach(), done)
+            else:
+                trans, step_done = reconstruction.step(act.detach(), done, step)
+                self.write_reconstruction_diagnostics(reconstruction)
+                for slot, report in enumerate(reconstruction.reports):
+                    if report["failure"]:
+                        returns[slot] = lengths[slot] = 0
+                        if slot == 0:
+                            video_cache = []
             # dict of (B, 1, *)
             trans = trans.to(agent.device, non_blocking=True)
             # (B,)
@@ -153,7 +193,10 @@ class OnlineTrainer:
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.
             # (B, A)
-            act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
+            if reconstruction is None:
+                act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
+            else:
+                act, agent_state = reconstruction.act(trans, agent_state)
 
             # Store transition.
             # We keep the observation and the action that produced it together.
@@ -164,7 +207,11 @@ class OnlineTrainer:
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])
-            self.replay_buffer.add_transition(trans.detach())
+            if reconstruction is None:
+                self.replay_buffer.add_transition(trans.detach())
+            else:
+                reconstruction.record(trans, done)
+                episode_is_recon = trans["is_recon"].reshape(-1)
             returns += trans["reward"][:, 0]
             # Update models after enough data has accumulated
             if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
@@ -172,13 +219,24 @@ class OnlineTrainer:
                     update_num = self.pretrain
                 else:
                     update_num = self._updates_needed(step)
-                for _ in range(update_num):
-                    _metrics = agent.update(self.replay_buffer, env_step=step)
-                    train_metrics = _metrics
-                update_count += update_num
+                update_credit += update_num
+                while update_credit > 0:
+                    try:
+                        train_metrics = agent.update(self.replay_buffer, env_step=step)
+                    except ReplayNotReady:
+                        break
+                    update_credit -= 1
+                    update_count += 1
+                    if reconstruction is not None:
+                        reconstruction.ingest()
+                if reconstruction is not None:
+                    train_metrics.update(reconstruction.metrics())
                 # Log training metrics
                 if self._should_log(step):
                     for name, value in train_metrics.items():
+                        # Keep the raw diagnostic internal; preserve the historical normalized log.
+                        if name == "imag_adv_full_raw":
+                            continue
                         value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                         if name in (
                             "imag_wasser",
@@ -193,10 +251,19 @@ class OnlineTrainer:
                         else:
                             self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
+                    self.logger.scalar("train/opt/deferred_updates", update_credit)
                     if self.video_pred_log:
-                        data, _, initial = self.replay_buffer.sample()
-                        self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                        try:
+                            data, _, initial = self.replay_buffer.sample()
+                        except ReplayNotReady:
+                            pass  # Pending branches must not make optional video logging fatal.
+                        else:
+                            self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
                     self.logger.write(step, fps=True)
+
+        if reconstruction is not None:
+            reconstruction.close()
+            self.write_reconstruction_diagnostics(reconstruction, final=True)

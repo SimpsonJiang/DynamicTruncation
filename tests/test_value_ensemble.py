@@ -769,12 +769,78 @@ class ValueEnsembleTest(unittest.TestCase):
         data, initial = self.make_batch(agent)
         with mock.patch.object(agent, "_lambda_return", wraps=agent._lambda_return) as returns:
             _, metrics = agent._cal_grad(data, initial)
-        self.assertEqual(returns.call_count, 2)  # Only imagination and replay; no full-horizon gate return.
+        self.assertEqual(returns.call_count, 3)  # Full imagination, masked imagination, replay.
+        self.assertEqual(metrics["imag_adv_full_raw"].shape, (3, 1))
+        self.assertFalse(metrics["imag_adv_full_raw"].requires_grad)
         self.assertNotIn("imag_adv_full", metrics)
         self.assertNotIn("imag_trunc_score", metrics)
-        # Disabling truncation also disables gate state/work even if a mode is configured.
+        # Disabling truncation still disables gate state/work, but keeps raw full advantage.
         disabled = self.make_agent(trunc_enabled=False, advantage={"mode": "signed"})
         self.assertIsNone(disabled.adv_scale)
+
+    def test_off_full_advantage_is_diagnostic_only_when_truncation_is_active(self):
+        agent = self.make_agent(trunc_enabled=True, min_horizon=1, outscale=0.1)
+        data, initial = self.make_batch(agent)
+        state = {key: value.clone() for key, value in agent.state_dict().items()}
+        scores = torch.tensor([1.0, 10.0, 10.0]).reshape(1, 3, 1).expand(8, -1, -1)
+        original_return = agent._lambda_return
+        outputs = []
+        for offset in (0.0, 100.0):
+            agent.load_state_dict(state)
+            agent.zero_grad(set_to_none=True)
+            calls = []
+
+            def shifted_full_return(*args):
+                value = original_return(*args)
+                if not calls:
+                    self.assertEqual(torch.count_nonzero(args[0]).item(), 0)
+                    value = value + offset
+                calls.append((args, value))
+                return value
+
+            torch.manual_seed(91)
+            with (
+                mock.patch("dreamer.cal_ens_uncertainty", return_value=scores),
+                mock.patch.object(agent, "_lambda_return", side_effect=shifted_full_return),
+            ):
+                _, metrics = agent._cal_grad(data, initial)
+            self.assertEqual(len(calls), 3)
+            self.assertGreater(torch.count_nonzero(calls[1][0][0]).item(), 0)
+            expected = (calls[0][1] - calls[0][0][3][:, :-1]).mean(dim=0)
+            torch.testing.assert_close(metrics["imag_adv_full_raw"], expected)
+            self.assertFalse(metrics["imag_adv_full_raw"].requires_grad)
+            outputs.append((
+                {key: value.detach().clone() for key, value in metrics.items()},
+                {key: None if p.grad is None else p.grad.clone() for key, p in agent._named_params.items()},
+                torch.get_rng_state().clone(),
+            ))
+        before, after = outputs
+        torch.testing.assert_close(
+            after[0]["imag_adv_full_raw"] - before[0]["imag_adv_full_raw"], torch.full((3, 1), 100.0)
+        )
+        for key in before[0]:
+            if key != "imag_adv_full_raw":
+                torch.testing.assert_close(before[0][key], after[0][key], rtol=0, atol=0)
+        for key, grad in before[1].items():
+            if grad is None:
+                self.assertIsNone(after[1][key])
+            else:
+                torch.testing.assert_close(grad, after[1][key], rtol=0, atol=0)
+        torch.testing.assert_close(before[2], after[2], rtol=0, atol=0)
+
+    def test_off_full_advantage_matches_untruncated_targets_without_gate_state(self):
+        for enabled in (False, True):
+            with self.subTest(truncation_enabled=enabled):
+                agent = self.make_agent(trunc_enabled=enabled, warmup_steps=50_000, outscale=0.1)
+                data, initial = self.make_batch(agent)
+                with mock.patch.object(agent, "_lambda_return", wraps=agent._lambda_return) as returns:
+                    _, metrics = agent._cal_grad(data, initial, truncation_active=False)
+                # Reuse full return for actor/value, then compute replay return.
+                self.assertEqual(returns.call_count, 2)
+                scale = (agent.return_ema.ema_vals[1] - agent.return_ema.ema_vals[0]).clamp_min(1)
+                torch.testing.assert_close(metrics["imag_adv_full_raw"].mean() / scale, metrics["adv"])
+                self.assertIsNone(agent.adv_scale)
+                self.assertFalse(any(key.startswith("adv_scale.") for key in agent.state_dict()))
 
     def test_advantage_factor_one_preserves_returns_losses_gradients_and_rng(self):
         for mode in ("positive_only", "signed"):

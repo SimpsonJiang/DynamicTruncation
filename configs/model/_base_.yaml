@@ -5,6 +5,16 @@ horizon: 333
 lamb: 0.95
 compile: True
 log_grads: False
+physics_decoder:
+  enabled: false
+  grad_to_wm: false
+  hidden: 256
+  lr: 1.0e-3
+  loss_scale: 1.0
+  grad_clip: 100.0
+  norm_decay: 0.99
+  norm_eps: 1.0e-3
+  schema: null
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 

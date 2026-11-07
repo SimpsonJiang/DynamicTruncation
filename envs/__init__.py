@@ -3,18 +3,20 @@ import atexit
 from . import parallel, wrappers
 
 
-def make_envs(config):
+def make_envs(config, *, physics=False):
     suite = config.task.split("_", 1)[0]
+    if physics and suite != "dmc":
+        raise ValueError("Online physics labels and reconstruction require DMC")
 
     if suite == "isaaclab":
         return _make_isaaclab_envs(config)
 
     def env_constructor(idx):
-        return lambda: make_env(config, idx)
+        return lambda: make_env(config, idx, physics=physics)
 
-    train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
+    train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device, physics=physics)
     eval_envs = (
-        parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
+        parallel.ParallelEnv(lambda idx: lambda: make_env(config, idx), config.eval_episode_num, config.device)
         if config.eval_episode_num > 0
         else None
     )
@@ -52,7 +54,7 @@ def _make_isaaclab_envs(config):
     return train_envs, eval_envs, obs_space, act_space
 
 
-def make_env(config, id):
+def make_env(config, id, *, physics=False):
     suite, task = config.task.split("_", 1)
     if suite == "dmc":
         import envs.dmc as dmc
@@ -102,5 +104,10 @@ def make_env(config, id):
         )
     else:
         raise NotImplementedError(suite)
-    env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
-    return wrappers.Dtype(env)
+    time_limit = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
+    env = wrappers.Dtype(time_limit)
+    if physics:
+        from .online_physics import OnlinePhysicsEnv
+
+        env = OnlinePhysicsEnv(env, config, time_limit=time_limit)
+    return env

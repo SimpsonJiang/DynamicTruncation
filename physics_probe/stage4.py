@@ -145,8 +145,8 @@ def main():
     protocol = json.loads((source / "protocol.json").read_text())
     if protocol.get("checkpoint_group") != args.checkpoint_group or len(protocol["entries"]) != args.expected_models:
         raise ValueError("Source checkpoint group or model count differs from the explicitly selected campaign")
-    if not 1 <= len(args.cpus) <= 2 or len(set(args.cpus)) != len(args.cpus):
-        raise ValueError("Use one or two distinct CPU cores for this campaign")
+    if not 1 <= len(args.cpus) <= 6 or len(set(args.cpus)) != len(args.cpus):
+        raise ValueError("Use one to six distinct CPU cores for this campaign")
     if not set(args.cpus) <= os.sched_getaffinity(0):
         raise ValueError("Requested CPUs are outside current affinity")
     if args.horizon < 1 or min(args.points) < 0 or len(set(args.points)) != len(args.points):

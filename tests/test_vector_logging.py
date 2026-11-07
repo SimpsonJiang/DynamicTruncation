@@ -105,7 +105,11 @@ class VectorLoggingTest(unittest.TestCase):
         agent = mock.Mock(device=torch.device("cpu"))
         agent.get_initial_state.return_value = state
         agent.act.return_value = (torch.zeros(env_num, 1), state)
-        agent.update.return_value = {metric: torch.tensor([[1.0], [2.0]]), "loss": torch.tensor(3.0)}
+        agent.update.return_value = {
+            metric: torch.tensor([[1.0], [2.0]]),
+            "imag_adv_full_raw": torch.tensor([[10.0], [20.0]]),
+            "loss": torch.tensor(3.0),
+        }
         replay = mock.Mock()
         replay.count.return_value = 0
         logger = mock.Mock()
@@ -121,6 +125,8 @@ class VectorLoggingTest(unittest.TestCase):
             np.testing.assert_array_equal(call.args[1], np.array([[1.0], [2.0]]))
         self.assertTrue(any(call.args[0] == "train/loss" for call in logger.scalar.call_args_list))
         self.assertFalse(any(call.args[0] == f"train/{metric}" for call in logger.scalar.call_args_list))
+        for method in (logger.vector, logger.scalar):
+            self.assertFalse(any(call.args[0] == "train/imag_adv_full_raw" for call in method.call_args_list))
 
 
 if __name__ == "__main__":

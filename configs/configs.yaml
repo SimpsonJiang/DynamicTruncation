@@ -25,6 +25,7 @@ buffer:
   storage_device: ${device}
 
 trainer:
+  reconstruction: ${reconstruction}
   steps: ${env.steps}
   pretrain: 0
   eval_every: 1e4
@@ -36,3 +37,26 @@ trainer:
   params_hist_log: False
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}
+
+# Both features are opt-in. These budgets are included in env.steps/train_ratio.
+reconstruction:
+  enabled: false
+  ratio: 0.10
+  max_active: 2
+  branch_steps: 64
+  max_consecutive: 2
+  credit_cap_steps: 128
+  warmup_env_steps: 100000
+  calibration_env_steps: 50000
+  validation_env_steps: 50000
+  max_false_reject: 0.001
+  seed: ${seed}
+  candidates:
+    capacity: 1024
+    top_k: 32
+    ttl_updates: 128
+    refresh_every_updates: 8
+    max_insert: 64
+    max_per_origin: 2
+    deter_cosine_threshold: 0.98
+    action_rms_threshold: 0.10

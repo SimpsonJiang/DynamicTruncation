@@ -79,9 +79,10 @@ to `model.dynamic_trunc.advantage.mode=off`; `uv_run.sh` explicitly selects
 Supported uncertainty metrics are `wasser`, `cramer`, `sqrt_cramer`, and `sigma`;
 `ucb` is rejected when this adjustment is enabled because its score can be negative.
 
-The gate first computes full-horizon lambda returns (using the existing lambda,
+Every update computes full-horizon lambda returns, including when advantage mode
+is `off` (using the existing lambda,
 normally 0.95, and bootstrap at H) and `delta_full = return_full - value` on the
-same imagined trajectory and randomly selected value pair. An independent EMA
+same imagined trajectory and value baseline. When the gate is enabled, an independent EMA
 normalizes this advantage without mean subtraction. It uses the previous EMA of
 the batch/time absolute-advantage quantile (default 0.9), decay 0.99 and a scale
 floor of 1e-6; the first valid batch initializes the EMA. Nonfinite entries are
@@ -117,7 +118,10 @@ The launcher exposes `adv_mode`, `adv_max_factor`, `adv_scale_quantile`,
 mode/factor in the method name, for example
 `VE_wasser_symlog_advpositive_only_x2.0_w50k_f64_H15`.
 
-When enabled, `train/imag_adv_full` logs normalized full advantage and
+Raw full advantage is computed independently of the gate; its diagnostic remains
+internal and is not written to the training logger. No normalization buffers are
+added to `off` checkpoints. When the gate is enabled,
+`train/imag_adv_full` logs normalized full advantage and
 `train/imag_trunc_score` logs adjusted uncertainty, each as a `[H,1]` curve.
 Existing uncertainty curves and `train/adv` retain their meanings; the latter
 still averages the training advantage over all positions, including masked ones.
@@ -298,3 +302,6 @@ url={https://openreview.net/forum?id=Je2QqXrcQq}
 
 [r2dreamer]: https://openreview.net/forum?id=Je2QqXrcQq&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2026%2FConference%2FAuthors%23your-submissions)
 [dreamerv3-torch]: https://github.com/NM512/dreamerv3-torch
+
+在线物理状态 decoder、穿模门槛和动态重建采样的开关、数据契约及验证入口见
+[在线重建说明](docs/online_reconstruction.md)。两个功能默认关闭；重建通过原有环境槽采样，计入原交互预算。

@@ -11,6 +11,15 @@ class TimeLimit(gym.Wrapper):
         self._duration = duration
         self._step = None
 
+    @property
+    def duration(self):
+        return self._duration
+
+    def restore_elapsed_steps(self, steps):
+        if int(steps) != steps or not 0 <= steps < self._duration:
+            raise ValueError("Restored episode counter is outside the time limit")
+        self._step = int(steps)
+
     def step(self, action):
         assert self._step is not None, "Must reset environment."
         obs, reward, done, info = self.env.step(action)

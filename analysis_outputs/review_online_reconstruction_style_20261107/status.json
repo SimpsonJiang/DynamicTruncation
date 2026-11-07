@@ -1,0 +1,28 @@
+{
+  "status": "review_complete",
+  "scope": "online reconstruction style and interface review",
+  "production_code_modified": false,
+  "training_run": false,
+  "gpu_used": false,
+  "tmpdir": "/mnt/phx2/tmp",
+  "findings": {
+    "confirmed_interface_gaps": [
+      "F1",
+      "F2"
+    ],
+    "maintainability_or_compatibility": [
+      "F3",
+      "F4",
+      "F5",
+      "F6",
+      "F7"
+    ]
+  },
+  "checks": {
+    "black_version": "24.3.0",
+    "isort_version": "5.13.2",
+    "new_production_modules_black_unstable": true,
+    "full_precommit_run": false,
+    "runtime_reproductions_run": false
+  }
+}

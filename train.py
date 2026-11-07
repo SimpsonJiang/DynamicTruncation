@@ -39,7 +39,16 @@ def main(config):
     replay_buffer = Buffer(config.buffer)
 
     print("Create envs.")
-    train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
+    physics_enabled = bool(config.model.get("physics_decoder", {}).get("enabled", False))
+    if config.get("reconstruction", {}).get("enabled", False) and not physics_enabled:
+        raise ValueError("reconstruction.enabled requires model.physics_decoder.enabled")
+    train_envs, eval_envs, obs_space, act_space = make_envs(config.env, physics=physics_enabled)
+    if physics_enabled:
+        from omegaconf import open_dict
+
+        with open_dict(config.model.physics_decoder):
+            config.model.physics_decoder.schema = train_envs.physics_schema()
+        logger.log_hydra_config(config)
 
     print("Simulate agent.")
     agent = Dreamer(
@@ -55,6 +64,9 @@ def main(config):
         "agent_state_dict": agent.state_dict(),
         "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
     }
+    if physics_enabled:
+        items_to_save["physics_schema"] = agent.physics_head.codec.schema
+        items_to_save["physics_dtype"] = "float64"
     torch.save(items_to_save, logdir / "latest.pt")
 
 

@@ -273,6 +273,19 @@ class Dreamer(nn.Module):
 
         self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda) #先逐渐增大学习率，再保持不变
 
+        self.reconstruction_config = None
+        self.reconstruction_updates = 0
+        self._reconstruction_candidates = None
+        self.physics_head = None
+        physics_config = config.get("physics_decoder", {})
+        self.physics_grad_to_wm = bool(physics_config.get("grad_to_wm", False))
+        if physics_config.get("enabled", False):
+            from physics_decoder import Float64Adam, OnlinePhysicsDecoder
+
+            self.physics_head = OnlinePhysicsDecoder(self.rssm.feat_size, physics_config)
+            self.physics_optimizer = Float64Adam(self.physics_head.parameters(), lr=float(physics_config.lr))
+            self.physics_loss_scale = float(physics_config.loss_scale)
+            self.physics_grad_clip = float(physics_config.grad_clip)
         self.train()
         self.clone_and_freeze()    #把所有网络都克隆一份，以供actor-critic learning使用
         if config.compile:
@@ -397,6 +410,61 @@ class Dreamer(nn.Module):
             batch_size=state.batch_size,
         )
 
+    def configure_reconstruction(self, config):
+        if self.physics_head is None:
+            raise ValueError("Reconstruction requires an online physics decoder")
+        if self.rep_loss not in ("dreamer", "r2dreamer"):
+            raise ValueError("Branch losses currently support dreamer and r2dreamer representations")
+        self.reconstruction_config = config
+
+    @property
+    def reconstruction_candidates(self):
+        """Read-only view; consumers use take_reconstruction_candidates to drain it."""
+        return self._reconstruction_candidates
+
+    def take_reconstruction_candidates(self):
+        packet = self._reconstruction_candidates
+        self._reconstruction_candidates = None
+        return packet
+
+    def candidate_distance_statistics(self):
+        """Describe the deterministic coordinates used by the host-side deduplicator."""
+        split = self.rssm.flat_stoch
+        return dict(
+            flat_stoch=split,
+            deter_mean=self.physics_head.input_mean[split:].detach().cpu().numpy(),
+            deter_scale=self.physics_head.input_scale[split:].detach().cpu().numpy(),
+        )
+
+    @torch.no_grad()
+    def decode_physics(self, features):
+        if self.physics_head is None:
+            raise ValueError("Physics decoder is disabled")
+        with autocast(device_type=self.device.type, enabled=False):
+            return self.physics_head(torch.as_tensor(features, device=self.device))
+
+    @torch.no_grad()
+    def act_with_seeds(self, obs, state, seed_features, seed_actions):
+        """Use saved current latents/actions at branch roots; observe other slots normally."""
+        root = obs["is_branch"].reshape(-1)
+        normal = (~root).nonzero().flatten()
+        roots = root.nonzero().flatten()
+        result, action = state.clone(), state["prev_action"].clone()
+        if len(normal):
+            action[normal], normal_state = self.act(obs[normal].clone(), state[normal], eval=False)
+            result[normal] = normal_state
+        if len(roots):
+            features = torch.as_tensor(seed_features, device=self.device)
+            actions = torch.as_tensor(seed_actions, device=self.device, dtype=action.dtype)
+            if features.shape[0] != len(roots) or actions.shape[0] != len(roots):
+                raise ValueError("Branch seeds must match the root slots in ascending order")
+            stoch, deter = self.rssm.state_from_feat(features)
+            action[roots] = actions
+            result["stoch"][roots] = stoch.to(result["stoch"].dtype)
+            result["deter"][roots] = deter.to(result["deter"].dtype)
+            result["prev_action"][roots] = actions
+        return action, result
+
     @torch.no_grad()
     def get_initial_state(self, B):
         stoch, deter = self.rssm.initial(B)
@@ -423,6 +491,8 @@ class Dreamer(nn.Module):
             data["action"][:B, :5],
             tuple(val[:B] for val in initial),
             data["is_first"][:B, :5],
+            data["is_branch"][:B, :5] if "is_branch" in data else None,
+            (data["branch_stoch"][:B, :5], data["branch_deter"][:B, :5]) if "is_branch" in data else None,
         )
         recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
@@ -441,6 +511,8 @@ class Dreamer(nn.Module):
         """Optimize one batch; env_step uses the trainer's action-repeat-scaled Step."""
         data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
+        if self.physics_head is not None:
+            self.physics_head.validate_labels(data["physics", "core"])
         p_data = self.preprocess(data)
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
@@ -448,8 +520,19 @@ class Dreamer(nn.Module):
         metrics = {}
         # Only a boolean enters the compiled function, not the changing environment step.
         truncation_active = self.dynamic_trunc_enabled and env_step >= self.dynamic_trunc_warmup_steps
+        collect_candidates = (
+            self.reconstruction_config is not None
+            and self.reconstruction_updates % self.reconstruction_config.candidates.refresh_every_updates == 0
+        )
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial, truncation_active=truncation_active)
+            if self.reconstruction_config is None:
+                (stoch, deter), mets = self._cal_grad(p_data, initial, truncation_active=truncation_active)
+            else:
+                (stoch, deter), mets = self._cal_grad(
+                    p_data, initial, truncation_active=truncation_active, collect_candidates=collect_candidates
+                )
+        self._reconstruction_candidates = mets.pop("_candidates", None)
+        self.reconstruction_updates += 1
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
@@ -461,6 +544,11 @@ class Dreamer(nn.Module):
             mets["opt/grad_norm"] = grad_norm
             mets["opt/grad_rms"] = grad_rms
         self._agc(self._named_params.values())  # clipping
+        if self.physics_head is not None and self.physics_grad_to_wm:
+            self._scaler.unscale_(self.physics_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.physics_head.parameters(), self.physics_grad_clip)
+            self._scaler.step(self.physics_optimizer)
+            self.physics_optimizer.zero_grad(set_to_none=True)
         self._scaler.step(self._optimizer)  # update params
         self._scaler.update()  # adjust scale
         self._scheduler.step()  # increment scheduler
@@ -473,12 +561,20 @@ class Dreamer(nn.Module):
             params_rms = tools.compute_rms(self._named_params.values())
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
+        if self.physics_head is not None and not self.physics_grad_to_wm:
+            feat = self.rssm.get_feat(stoch.detach(), deter.detach())
+            loss = self.physics_head.training_loss(feat, data["physics", "core"], data.get("physics_valid"))
+            (loss * self.physics_loss_scale).backward()
+            torch.nn.utils.clip_grad_norm_(self.physics_head.parameters(), self.physics_grad_clip)
+            self.physics_optimizer.step()
+            self.physics_optimizer.zero_grad(set_to_none=True)
+            mets["loss/physics"] = loss.detach()
         metrics.update(mets)
         # update latent vectors in replay buffer
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
-    def _cal_grad(self, data, initial, *, truncation_active=None):
+    def _cal_grad(self, data, initial, *, truncation_active=None, collect_candidates=False):
         """Compute gradients for one batch.
 
         Notes
@@ -502,18 +598,30 @@ class Dreamer(nn.Module):
         # (B, T, E)
         embed = self.encoder(data)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
+        branch = data.get("is_branch")
+        seeds = (data["branch_stoch"], data["branch_deter"]) if branch is not None else None
+        post_stoch, post_deter, post_logit = self.rssm.observe(
+            embed, data["action"], initial, data["is_first"], branch, seeds)
+        valid = ~branch.squeeze(-1) if branch is not None else None
+
+        def supervised_mean(value):
+            if valid is None:
+                return value.mean()
+            mask = valid.reshape(*valid.shape, *([1] * (value.ndim - 2))).expand_as(value)
+            return torch.where(mask, value, 0).sum() / mask.sum().clamp_min(1)
+
         # (B, T, S, K)
         _, prior_logit = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
-        losses["dyn"] = torch.mean(dyn_loss)
-        losses["rep"] = torch.mean(rep_loss)
+        losses["dyn"] = supervised_mean(dyn_loss)
+        losses["rep"] = supervised_mean(rep_loss)
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
         if self.rep_loss == "dreamer":
             recon_losses = {
-                key: torch.mean(-dist.log_prob(data[key])) for key, dist in self.decoder(post_stoch, post_deter).items()
+                key: supervised_mean(-dist.log_prob(data[key]))
+                for key, dist in self.decoder(post_stoch, post_deter).items()
             }
             losses.update(recon_losses)
         elif self.rep_loss == "r2dreamer":
@@ -524,14 +632,21 @@ class Dreamer(nn.Module):
             # (B, T, E) -> (B*T, E)
             x2 = embed.reshape(B * T, -1).detach()  # this detach is important
 
-            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
-            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
+            if valid is not None:
+                x1, x2 = x1[valid.reshape(-1)], x2[valid.reshape(-1)]
+            if valid is not None and x1.shape[0] < 2:
+                # A short branch window may contain only one genuine observation.
+                # Cross-correlation is undefined; skip this auxiliary term only.
+                losses["barlow"] = x1.sum() * 0
+            else:
+                x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
+                x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
 
-            c = torch.mm(x1_norm.T, x2_norm) / (B * T)
-            invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-            off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
-            redundancy_loss = c[off_diag_mask].pow(2).sum()
-            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+                c = torch.mm(x1_norm.T, x2_norm) / x1.shape[0]
+                invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+                off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
+                redundancy_loss = c[off_diag_mask].pow(2).sum()
+                losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
         elif self.rep_loss == "infonce":
             # Contrastive (InfoNCE) objective between projected latent features and encoder embeddings.
             # (B, T, F) -> (B*T, F)
@@ -563,12 +678,12 @@ class Dreamer(nn.Module):
             raise NotImplementedError
 
         # reward and continue
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+        losses["rew"] = supervised_mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
         cont = 1.0 - to_f32(data["is_terminal"])
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+        losses["con"] = supervised_mean(-self.cont(feat).log_prob(cont))
         # log
-        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
-        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        metrics["dyn_entropy"] = supervised_mean(self.rssm.get_dist(prior_logit).entropy())
+        metrics["rep_entropy"] = supervised_mean(self.rssm.get_dist(post_logit).entropy())
 
         # === Imagination rollout for actor-critic ===
         # (B*T, S, K), (B*T, D)
@@ -608,12 +723,13 @@ class Dreamer(nn.Module):
         loss_mask = 1.0
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
-        full_ret = None
+        # Keep the untruncated advantage available independently of the optional gate.
+        # It uses the same trajectory/value baseline; no extra rollout or head sampling.
+        full_ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
+        full_adv = (full_ret - imag_value[:, :-1]).detach().float()
+        metrics["imag_adv_full_raw"] = full_adv.mean(dim=0)
         trunc_score = imag_uncertainty
         if self.adv_scale is not None:
-            # Full-horizon gate advantage is independent of the current truncation mask.
-            full_ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
-            full_adv = (full_ret - imag_value[:, :-1]).detach().float()
             gate_adv, adv_scale = self.adv_scale(full_adv)
             trunc_score = advantage_truncation_score(
                 imag_uncertainty, gate_adv, mode=self.adv_trunc_mode, max_factor=self.adv_trunc_max_factor
@@ -650,10 +766,32 @@ class Dreamer(nn.Module):
                 metrics["dynamic_trunc/raw_effective_horizon"] = raw_mask.float().sum(dim=1).mean()
                 metrics["dynamic_trunc/positive_adv_drop_fraction"] = positive_drop
                 metrics["dynamic_trunc/negative_adv_drop_fraction"] = negative_drop
-        # Reuse full returns during warmup; actor/value targets otherwise retain the original masked recursion.
+        if collect_candidates and truncation_active:
+            depth = trunc_mask.squeeze(-1).sum(1).long()
+            row = torch.arange(B * T, device=imag_feat.device)
+            safe_depth = depth.clamp(max=self.imag_horizon - 1)
+            score = full_adv[row, safe_depth, 0]
+            eligible = (
+                (depth < self.imag_horizon)
+                & (score > 0)
+                & ~data["is_recon"].reshape(-1)
+                & ~data["is_last"].reshape(-1)
+            )
+            ranked = torch.where(eligible, score, -torch.inf)
+            n = min(B * T, self.reconstruction_config.candidates.capacity)
+            selected = torch.topk(ranked, n).indices
+            metrics["_candidates"] = {
+                "score": ranked[selected].detach(),
+                "depth": depth[selected].detach(),
+                "feature": imag_feat[selected, safe_depth[selected]].detach(),
+                "actions": imag_action[selected].detach(),
+                "origin": data["origin"].reshape(-1, 2)[selected].detach(),
+                "context": data["physics", "context"].reshape(B * T, -1)[selected].detach(),
+            }
+        # Reuse full returns without truncation; otherwise keep the original masked recursion.
         ret = (
             full_ret
-            if full_ret is not None and not truncation_active
+            if not truncation_active
             else self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
         )  # (B*T, T_imag-1, 1)
         ret_for_stats = torch.where(trunc_mask, ret, imag_value[:, :-1]) if truncation_active else ret
@@ -710,6 +848,19 @@ class Dreamer(nn.Module):
         value = values.mean(dim=0)
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last
+        if branch is not None:
+            jump = branch | data["is_first"]
+            last = torch.where(jump, 1., last)
+            term = torch.where(jump, 1., term)
+            reward = torch.where(jump, 0., reward)
+            # The root's outgoing real transition is valid; only its incoming edge is fictitious.
+            weight = weight.clone()
+            weight[:, :-1] *= (~jump[:, 1:]).float()
+            valid_transitions = ~jump
+            metrics["reconstruction/batch_valid_fraction"] = (
+                (data["is_recon"] & valid_transitions).float().sum()
+                / valid_transitions.float().sum().clamp_min(1)
+            )
         ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
@@ -725,6 +876,10 @@ class Dreamer(nn.Module):
         metrics["value_ensemble_std_replay"] = values.std(dim=0, unbiased=False).mean()
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
+        if self.physics_head is not None and self.physics_grad_to_wm:
+            physics_loss = self.physics_head.training_loss(feat, data["physics", "core"], data.get("physics_valid"))
+            total_loss = total_loss + self.physics_loss_scale * physics_loss
+            metrics["loss/physics"] = physics_loss.detach()
         self._scaler.scale(total_loss).backward()
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
