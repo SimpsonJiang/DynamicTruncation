@@ -90,7 +90,9 @@ Decoder 为两层 256 单元 SiLU MLP，Adam lr=1e-3，loss scale=1，梯度范�
 - `is_branch` 只标分支根；`is_recon` 标整个片段。
 - 根 latent 复用 replay 的 `stoch/deter`，由 `is_branch` 标记并禁止 latent 回写覆盖。
   采样时仅为当前 batch 构造 `branch_stoch/branch_deter`，保持 RSSM 接口不变。
-- RSSM 在窗口任意位置遇到根时直接读取 seed，不对根执行 obs_step；普通 is_first 仍清零。
+- RSSM 在窗口任意位置遇到根时，最终 latent 直接采用 detached seed；普通 is_first 仍清除旧历史。
+  为保持编译图和 batch 形状固定，先对整个 batch 计算 posterior，再用 `torch.where` 覆盖根位置的
+  latent/logits；根的普通计算结果被丢弃，不参与状态接续及根节点监督。
 - 首动作使用候选动作；真实下一观测到达后，当前策略 posterior 闭环采样。
 - 根的虚构入边、占位奖励、观测/KL/物理标签监督被屏蔽；根之后的真实转移仍训练。
 - `reserve/commit/discard` 保持二维按槽布局。未完成/失败位置不可采样；提交检查位置代际。
@@ -148,6 +150,13 @@ replay 仅保留原有一份 `stoch/deter`，普通位置是可更新缓存，�
 相比首版重复存储，默认 size12M、50万行、float32 latent 时减少约4.77 GiB常驻显存。
 当前 batch 的分支种子张量仍有小量临时开销，float64 标签/上下文保持不变。
 修改仅对新启动进程生效，不会释放正在运行的旧进程已分配的存储。
+
+RSSM 的训练扫描不再按根标记执行 `nonzero`、动态缩小 batch 或 `index_copy`。
+旧路径遇到根后会把长序列拆成小图；在 `torch.compile(mode="reduce-overhead")` 下，
+这些图的 CUDA Graph Trees 录制及全量 GC 可引入显著 CPU 停顿。
+固定形状路径仍保留根 seed、历史梯度切断和原有损失 mask。
+无根的 eager 扫描与普通路径的输出及随机数消耗逐元素一致；含根时会计算并丢弃根的 posterior，
+因此与旧动态切分实现的随机数消耗不同。不同编译图之间也不承诺随机样本逐元素相同。
 
 
 ## 模块接口与兼容性

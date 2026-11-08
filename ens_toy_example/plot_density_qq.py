@@ -15,6 +15,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 def plot(root):
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
     protocol = json.loads((root / "protocol.json").read_text())
     if protocol["status"] != "complete":
         raise ValueError("Density experiment must be complete")
@@ -86,9 +89,9 @@ def plot(root):
     with np.load(root / "data.npz") as data:
         draw_density(axes[0], data)
     ax = axes[1]
-    ax.plot(grid, values.mean(0), color="C0", lw=2, label="Q-Q: mean of 10 member pairs")
+    ax.plot(grid, values.mean(0), color="#0072B2", lw=2, label="Q-Q: mean of 10 member pairs")
     ax.fill_between(
-        grid, values.min(0), values.max(0), color="C0", alpha=0.2, label="range across initialization repeats"
+        grid, values.min(0), values.max(0), color="#0072B2", alpha=0.2, label="range across initialization repeats"
     )
     decorate_regions(ax)
     ax.set(

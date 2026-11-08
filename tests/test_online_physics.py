@@ -144,6 +144,46 @@ class SafetyAndReplayTest(CPUContractTest):
         d.sum().backward()
         self.assertTrue(torch.equal(embed.grad[roots[..., 0]], torch.zeros_like(embed.grad[roots[..., 0]])))
 
+    def test_no_root_matches_ordinary_observe_and_preserves_rng(self):
+        fixtures.ValueEnsembleTest.setUpClass()
+        agent = fixtures.ValueEnsembleTest().make_agent()
+        embed = torch.randn(2, 4, agent.embed_size)
+        action = torch.randn(2, 4, 2)
+        reset = torch.zeros(2, 4, 1, dtype=torch.bool)
+        reset[0, 2] = True
+        initial = agent.rssm.initial(2)
+        seed_s = torch.randn(2, 4, 4, 4)
+        seed_d = torch.randn(2, 4, 32)
+        rng = torch.random.get_rng_state()
+        expected = agent.rssm.observe(embed, action, initial, reset)
+        expected_rng = torch.random.get_rng_state()
+        torch.random.set_rng_state(rng)
+        actual = agent.rssm.observe(embed, action, initial, reset, torch.zeros_like(reset), (seed_s, seed_d))
+        for x, y in zip(actual, expected):
+            torch.testing.assert_close(x, y, rtol=0, atol=0)
+        self.assertTrue(torch.equal(expected_rng, torch.random.get_rng_state()))
+
+    def test_branch_cuts_history_gradients_and_observe_has_one_compiled_graph(self):
+        fixtures.ValueEnsembleTest.setUpClass()
+        agent = fixtures.ValueEnsembleTest().make_agent()
+        embed = torch.randn(2, 4, agent.embed_size, requires_grad=True)
+        action = torch.randn(2, 4, 2)
+        roots = torch.zeros(2, 4, 1, dtype=torch.bool)
+        roots[0, 2] = True
+        seeds = (torch.randn(2, 4, 4, 4, requires_grad=True), torch.randn(2, 4, 32, requires_grad=True))
+        initial = agent.rssm.initial(2)
+        reset = torch.zeros_like(roots)
+        _, deter, logit = agent.rssm.observe(embed, action, initial, reset, roots, seeds)
+        (deter[0, 3].square().sum() + logit[0, 3].square().sum()).backward()
+        self.assertEqual(int(torch.count_nonzero(embed.grad[0, :3])), 0)
+        self.assertGreater(float(embed.grad[0, 3].abs().sum()), 0)
+        self.assertIsNone(seeds[0].grad)
+        self.assertIsNone(seeds[1].grad)
+        explanation = torch._dynamo.explain(agent.rssm.observe)(embed, action, initial, reset, roots, seeds)
+        self.assertEqual(explanation.graph_count, 1)
+        self.assertEqual(explanation.graph_break_count, 0)
+        self.assertFalse(explanation.break_reasons)
+
     def test_budget_refund_failed_actions_and_ratio(self):
         from reconstruction import ReconstructionBudget
 
@@ -380,8 +420,9 @@ class SafetyAndReplayTest(CPUContractTest):
         def positive_returns(last, term, reward, value, boot, disc, lamb):
             return torch.ones_like(value[:, :-1]) * 100
 
-        with mock.patch("dreamer.build_truncation_mask", return_value=mask), mock.patch.object(
-            agent, "_lambda_return", side_effect=positive_returns
+        with (
+            mock.patch("dreamer.build_truncation_mask", return_value=mask),
+            mock.patch.object(agent, "_lambda_return", side_effect=positive_returns),
         ):
             ordinary = data.clone()
             ordinary["is_recon"].zero_()
@@ -398,8 +439,9 @@ class SafetyAndReplayTest(CPUContractTest):
         cfg = OmegaConf.create(dict(task="dmc_finger_spin", action_repeat=2, time_limit=100, size=[64, 64], seed=11))
         guarded, plain = make_env(cfg, 0, physics=True), make_env(cfg, 0, physics=True)
         image = np.zeros((64, 64, 3), np.uint8)
-        with mock.patch.object(guarded.base, "render", return_value=image), mock.patch.object(
-            plain.base, "render", return_value=image
+        with (
+            mock.patch.object(guarded.base, "render", return_value=image),
+            mock.patch.object(plain.base, "render", return_value=image),
         ):
             profile = guarded.setup_guard()
             self.assertIs(profile, guarded.setup_guard())

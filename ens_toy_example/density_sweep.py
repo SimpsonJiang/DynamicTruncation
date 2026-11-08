@@ -39,7 +39,7 @@ REGIONS = (
     ("empty_tail", 3.2, 4.2),
 )
 NORMALIZER = 0.675 + 0.1075 + 0.024 + 0.028
-COLORS = ("#badcb9", "#e7dfad", "#f4ceb0", "#dddddd", "#f4ceb0", "#dddddd")
+COLORS = ("#9ecae1", "#c6dbef", "#eff6fc", "#dddddd", "#eff6fc", "#dddddd")
 
 
 def masks(x):
@@ -95,7 +95,7 @@ def coverage(train_x, val_x):
 
 def decorate_regions(ax, labels=False):
     for (name, a, b), color in zip(REGIONS, COLORS):
-        ax.axvspan(a, b, color=color, alpha=0.25, zorder=0)
+        ax.axvspan(a, b, color=color, alpha=0.65, zorder=0)
         ax.axvline(a, color="grey", lw=0.6, ls=":")
         if labels:
             ax.text(
@@ -131,6 +131,10 @@ def plot_density(root, data):
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
 
     fig, ax = plt.subplots(figsize=(12, 3.6), constrained_layout=True)
     draw_density(ax, data)
@@ -263,10 +267,14 @@ def plot_results(root, data, results, seeds):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
+
     def draw_scores(ax, support, view):
         arrays = [np.load(root / f"comparison_{support}_s{s}" / f"{view}.npz") for s in seeds]
         x = arrays[0]["x"]
-        for key, label, color in zip(GROUPS, LABELS, ("C1", "C0", "C4")):
+        for key, label, color in zip(GROUPS, LABELS, ("#D55E00", "#0072B2", "#7B3294")):
             values = np.stack([a[key] for a in arrays])
             ax.plot(x, values.mean(0), color=color, label=label, lw=1.8)
             ax.fill_between(x, values.min(0), values.max(0), color=color, alpha=0.12)
@@ -274,18 +282,18 @@ def plot_results(root, data, results, seeds):
         ax.set(ylabel="Mean pairwise W1", title=f"{support} categorical bins; {view} W1")
         ax.legend(loc="upper left", fontsize=8)
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
     draw_density(axes[0], data)
     draw_scores(axes[1], "bounded", "full")
-    draw_scores(axes[2], "repository", "central")
     axes[-1].set_xlabel("x; two empty regions are shaded grey")
     fig.suptitle("Gradually varying coverage: lines = initialization mean, bands = observed min-max")
     fig.savefig(root / "density_comparison.png", dpi=180)
     fig.savefig(root / "density_comparison.pdf")
     plt.close(fig)
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
-    for ax, support in zip(axes, ("repository", "bounded")):
+    fig, axes = plt.subplots(1, 1, figsize=(12, 4), sharex=True, constrained_layout=True, squeeze=False)
+    axes = axes.ravel()
+    for ax, support in zip(axes, ("bounded",)):
         draw_scores(ax, support, "full")
         ax.set_yscale("log")
     axes[-1].set_xlabel("x")
@@ -298,8 +306,8 @@ def plot_results(root, data, results, seeds):
     q = np.load(root / f"quantile_s{seed}" / "predictions.npz")
     x, qa = q["x"], np.sort(q["atoms"], axis=-1)
     mean, scale = truth(x)
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True, sharey=True, constrained_layout=True)
-    for row, support in enumerate(("repository", "bounded")):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharex=True, sharey=True, constrained_layout=True, squeeze=False)
+    for row, support in enumerate(("bounded",)):
         cat = np.load(root / f"{support}_s{seed}" / "predictions.npz")
         cdf = cat["probs"].cumsum(-1)
         for col, tau in enumerate((0.5, 0.9)):
@@ -312,14 +320,14 @@ def plot_results(root, data, results, seeds):
                 ax.plot(
                     x,
                     cat["bins"][(cdf[i] >= tau).argmax(-1)],
-                    color="C1",
+                    color="#D55E00",
                     alpha=0.65,
                     label="categorical (5)" if i == 0 else None,
                 )
                 ax.plot(
                     x,
                     qa[i, :, int(np.ceil(tau * 255)) - 1],
-                    color="C0",
+                    color="#0072B2",
                     alpha=0.65,
                     label="quantile (5)" if i == 0 else None,
                 )

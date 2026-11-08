@@ -14,9 +14,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 def analyze(root):
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
     runs = json.loads((root / "summary.json").read_text())
     rows = []
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True, squeeze=False)
     for run in runs:
         name = f"{run['support']}_s{run['seed']}"
         saved = np.load(root / name / "predictions.npz")
@@ -54,19 +57,20 @@ def analyze(root):
                 },
             }
         )
-        row = 0 if run["support"] == "repository" else 1
-        axes[row, 0].plot(x, score, label=f"seed {run['seed']}")
-        axes[row, 1].plot(x, error)
-        axes[row, 2].plot(x, saved["mean_error"])
-        for col, label in enumerate(
-            ("W1 integrated over [-5,5]", "True error integrated over [-5,5]", "Absolute mean error")
-        ):
-            axes[row, col].set(title=f"{run['support']}: {label}", xlabel="x", yscale="log")
-            if run is next(r for r in runs if r["support"] == run["support"]):
-                axes[row, col].axvspan(-1, -0.3, color="green", alpha=0.08)
-                axes[row, col].axvspan(0.3, 1, color="green", alpha=0.08)
+        if run["support"] == "bounded":
+            row = 0
+            axes[row, 0].plot(x, score, label=f"seed {run['seed']}")
+            axes[row, 1].plot(x, error)
+            axes[row, 2].plot(x, saved["mean_error"])
+            for col, label in enumerate(
+                ("W1 integrated over [-5,5]", "True error integrated over [-5,5]", "Absolute mean error")
+            ):
+                axes[row, col].set(title=f"{run['support']}: {label}", xlabel="x", yscale="log")
+                if run is next(r for r in runs if r["support"] == run["support"]):
+                    axes[row, col].axvspan(-1, -0.3, color="#c6dbef", alpha=0.55)
+                    axes[row, col].axvspan(0.3, 1, color="#c6dbef", alpha=0.55)
         np.savez_compressed(root / name / "central_diagnostics.npz", x=x, central_w1=score, central_error=error)
-    for row in range(2):
+    for row in range(1):
         axes[row, 0].legend()
     fig.suptitle("Central-range diagnostics: same trained predictions, no renormalization or retraining")
     fig.savefig(root / "central_diagnostics.png", dpi=180)
@@ -93,15 +97,15 @@ def analyze(root):
 
     # Deterministic first seed display, not a seed selected for a desired result.
     first_seed = runs[0]["seed"]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-    for row, support in enumerate(("repository", "bounded")):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True, squeeze=False)
+    for row, support in enumerate(("bounded",)):
         saved = np.load(root / f"{support}_s{first_seed}" / "predictions.npz")
         x, quantiles = saved["x"], saved["quantiles"]
         mean, scale = truth(x)
         for col, quantile_index in enumerate((1, 2)):
             ax = axes[row, col]
-            ax.axvspan(-1, -0.3, color="green", alpha=0.08)
-            ax.axvspan(0.3, 1, color="green", alpha=0.08)
+            ax.axvspan(-1, -0.3, color="#c6dbef", alpha=0.55)
+            ax.axvspan(0.3, 1, color="#c6dbef", alpha=0.55)
             target = mean if quantile_index == 1 else mean + 0.8 * scale
             ax.plot(x, target, "k--", label="truth", lw=2)
             for i in range(5):

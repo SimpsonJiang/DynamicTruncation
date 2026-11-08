@@ -199,20 +199,25 @@ def plot_comparison(root, source, results, seeds, supports):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
+
+    plot_supports = [support for support in supports if support == "bounded"]
     fig, axes = plt.subplots(
-        len(supports), 2, figsize=(13, 4.4 * len(supports)), squeeze=False, constrained_layout=True
+        len(plot_supports), 2, figsize=(13, 4.4 * len(plot_supports)), squeeze=False, constrained_layout=True
     )
-    for row, support in enumerate(supports):
+    for row, support in enumerate(plot_supports):
         for col, view in enumerate(("full", "central")):
             ax = axes[row, col]
             arrays = [np.load(root / f"{support}_s{seed}" / f"{view}.npz") for seed in seeds]
             x = arrays[0]["x"]
-            for name, label, color in zip(GROUPS, LABELS, ("C1", "C0", "C4")):
+            for name, label, color in zip(GROUPS, LABELS, ("#D55E00", "#0072B2", "#7B3294")):
                 values = np.stack([a[name] for a in arrays])
                 ax.plot(x, values.mean(0), label=label, color=color)
                 ax.fill_between(x, values.min(0), values.max(0), color=color, alpha=0.12)
-            ax.axvspan(-1, -0.3, color="green", alpha=0.07)
-            ax.axvspan(0.3, 1, color="green", alpha=0.07)
+            ax.axvspan(-1, -0.3, color="#c6dbef", alpha=0.55)
+            ax.axvspan(0.3, 1, color="#c6dbef", alpha=0.55)
             title = "full W1" if view == "full" else "W1 over [-5,5] only (diagnostic)"
             ax.set(title=f"Categorical: {support} bins; {title}", xlabel="x", ylabel="Mean pairwise W1", yscale="log")
             ax.legend(fontsize=8, loc="lower left")
@@ -226,16 +231,16 @@ def plot_comparison(root, source, results, seeds, supports):
         arrays = [np.load(root / f"bounded_s{seed}" / "full.npz") for seed in seeds]
         x = arrays[0]["x"]
         maximum = 0.0
-        for name, label, color in zip(GROUPS, LABELS, ("C1", "C0", "C4")):
+        for name, label, color in zip(GROUPS, LABELS, ("#D55E00", "#0072B2", "#7B3294")):
             values = np.stack([a[name] for a in arrays])
             maximum = max(maximum, float(values.max()))
             ax.plot(x, values.mean(0), label=label, color=color, lw=2)
             ax.fill_between(x, values.min(0), values.max(0), color=color, alpha=0.12)
-        ax.axvspan(-1, -0.3, color="green", alpha=0.07)
-        ax.axvspan(0.3, 1, color="green", alpha=0.07)
+        ax.axvspan(-1, -0.3, color="#c6dbef", alpha=0.55)
+        ax.axvspan(0.3, 1, color="#c6dbef", alpha=0.55)
         ax.set(
             title="Five categorical vs five quantile members: bounded categorical bins",
-            xlabel="x (green = training support; white = OOD)",
+            xlabel="x (blue shading = training support; white = OOD)",
             ylabel="Mean pairwise W1 disagreement",
             ylim=(0, maximum * 1.2),
         )
@@ -251,9 +256,9 @@ def plot_comparison(root, source, results, seeds, supports):
     mean, scale = truth(x)
     data = np.load(source / "data.npz")
     fig, axes = plt.subplots(
-        len(supports), 2, figsize=(13, 4.4 * len(supports)), squeeze=False, constrained_layout=True
+        len(plot_supports), 2, figsize=(13, 4.4 * len(plot_supports)), squeeze=False, constrained_layout=True
     )
-    for row, support in enumerate(supports):
+    for row, support in enumerate(plot_supports):
         cat = np.load(source / f"{support}_s{seed}" / "predictions.npz")
         for col, tau in enumerate((0.5, 0.9)):
             ax = axes[row, col]
@@ -264,19 +269,19 @@ def plot_comparison(root, source, results, seeds, supports):
                 ax.plot(
                     x,
                     cat["quantiles"][i, :, 1 if col == 0 else 2],
-                    color="C1",
+                    color="#D55E00",
                     alpha=0.6,
                     label="categorical: 5 members" if i == 0 else None,
                 )
                 ax.plot(
                     x,
                     atoms[i, :, int(np.ceil(tau * atoms.shape[-1])) - 1],
-                    color="C0",
+                    color="#0072B2",
                     alpha=0.6,
                     label="quantile: 5 members" if i == 0 else None,
                 )
-            ax.axvspan(-1, -0.3, color="green", alpha=0.07)
-            ax.axvspan(0.3, 1, color="green", alpha=0.07)
+            ax.axvspan(-1, -0.3, color="#c6dbef", alpha=0.55)
+            ax.axvspan(0.3, 1, color="#c6dbef", alpha=0.55)
             ax.set(title=f"{support} categorical vs quantile: {tau:g} quantile", xlabel="x", ylabel="y", ylim=(-4, 4))
             ax.legend(fontsize=8, loc="upper left")
     fig.suptitle(f"Predictive distributions, seed {seed}; shaded band = full random target range")

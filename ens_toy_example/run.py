@@ -203,11 +203,15 @@ def plot_run(out, x, arrays, train_x, train_y, mode, seed, threshold):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
+
     mean, scale = truth(x)
     fig, axes = plt.subplots(1, 5, figsize=(17, 3.6), sharex=True, sharey=True, constrained_layout=True)
     for i, ax in enumerate(axes):
-        ax.axvspan(-1, -0.3, color="green", alpha=0.08)
-        ax.axvspan(0.3, 1, color="green", alpha=0.08)
+        ax.axvspan(-1, -0.3, color="#c6dbef", alpha=0.55)
+        ax.axvspan(0.3, 1, color="#c6dbef", alpha=0.55)
         ax.fill_between(x, mean - 0.8 * scale, mean + 0.8 * scale, color="black", alpha=0.12, label="true 10-90%")
         ax.scatter(train_x[::8], train_y[::8], s=3, color="black", alpha=0.25)
         for j, style in enumerate(("--", "-", "--")):
@@ -215,7 +219,7 @@ def plot_run(out, x, arrays, train_x, train_y, mode, seed, threshold):
         ax.plot(x, mean, "k:", lw=1)
         ax.set(title=f"Categorical {i + 1}", xlabel="x", xlim=(-2, 2), ylim=(-4, 4))
     axes[0].set_ylabel("y; predictive quantiles 10 / 50 / 90%")
-    fig.suptitle(f"{mode}, ensemble seed {seed}; green = training support; tails outside view")
+    fig.suptitle(f"{mode}, ensemble seed {seed}; blue shading = training support; tails outside view")
     fig.savefig(out / "distributions.png", dpi=170)
     fig.savefig(out / "distributions.pdf")
     plt.close(fig)

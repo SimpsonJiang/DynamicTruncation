@@ -141,33 +141,19 @@ class RSSM(nn.Module):
         """Posterior rollout using observations."""
         # (B, T, E), (B, T, A), ((B, S, K), (B, D)) (B, T)
         L = action.shape[1]
-        if branch is not None and not branch.any():
-            branch = None
         stoch, deter = initial
         stochs, deters, logits = [], [], []
         for i in range(L):
             # (B, S, K), (B, D), (B, S, K)
-            if branch is None:
-                stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
-            else:
+            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
+            if branch is not None:
+                # Keep the batch shape fixed so a root cannot fragment the compiled
+                # recurrence into one CUDA Graph per step. The root's computed
+                # posterior is discarded; its saved current state wins instead.
                 root = branch[:, i].reshape(-1)
-                normal = (~root).nonzero().flatten()
-                next_stoch = seeds[0][:, i].detach().clone()
-                next_deter = seeds[1][:, i].detach().clone()
-                logit_dtype = (
-                    torch.get_autocast_dtype(embed.device.type)
-                    if torch.is_autocast_enabled(embed.device.type)
-                    else embed.dtype
-                )
-                logit = torch.zeros_like(next_stoch, dtype=logit_dtype)
-                if normal.numel():
-                    s, d, posterior_logit = self.obs_step(
-                        stoch[normal], deter[normal], action[normal, i], embed[normal, i], reset[normal, i]
-                    )
-                    next_stoch = next_stoch.index_copy(0, normal, s.to(next_stoch.dtype))
-                    next_deter = next_deter.index_copy(0, normal, d.to(next_deter.dtype))
-                    logit = logit.index_copy(0, normal, posterior_logit.to(logit.dtype))
-                stoch, deter = next_stoch, next_deter
+                stoch = torch.where(root[:, None, None], seeds[0][:, i].detach(), stoch)
+                deter = torch.where(root[:, None], seeds[1][:, i].detach(), deter)
+                logit = torch.where(root[:, None, None], 0, logit)
             stochs.append(stoch)
             deters.append(deter)
             logits.append(logit)

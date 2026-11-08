@@ -123,3 +123,13 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS
 主图 `density_comparison.png/pdf` 同时画理论输入密度、实际采样直方图和三种分歧；`predictions.png/pdf` 画10个成员的预测与完整真分布范围。`coverage.json`、`region_summary.csv` 和 `summary.json` 保存区域数据。默认运行相同预算，不根据OOD结果选seed或模型。
 
 这一设计回答“不同覆盖区域里表现如何”。由于密度与x位置、目标函数曲率、插值/外推几何同时变化，它不是隔离数据量因果影响的实验；不能预设分歧必须随样本减少单调增加。与先前实验的x覆盖范围也不同，不直接将两个实验的数值当作同条件性能比较。
+
+### 2026-11-08：仅展示 bounded 的图像
+
+当前对比图只展示 bounded categorical（255 个 [-5,5] 等距支持点），保留 quantile、C-C/Q-Q/C-Q 和输入密度；repository 条件不再占据图像面板。原始逐次运行的 repository PNG/PDF 已移至 `logdir/ens_toy_example/archived_repository_figures/`，训练数据、checkpoint 和两种条件的数值表仍保留。
+
+本次仅重绘已有预测，没有重新训练或改变距离计算。旧 toy 图的 `full W1` 仍为 raw-return 坐标，`central` 仍为 [-5,5] 区间积分；**bounded 支持点不等于 symlog W1**。这些图不能作为当前仓库 symlog 距离的直接数值复现。
+
+### 红绿色弱配色
+
+所有当前展示的 toy 图使用统一配色，不加纹理：数据密度从高到低对应较深蓝、浅蓝、近白蓝；无数据区为灰色，保留区域名称及边界线。C-C、Q-Q、C-Q 分别为橙色（#D55E00）、蓝色（#0072B2）、紫色（#7B3294）。原始 toy 的训练区域也改为浅蓝，成员和 seed 曲线不再使用默认红绿配对。颜色只用于展示，不改变预测或距离数据。

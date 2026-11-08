@@ -14,16 +14,19 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 def plot(root):
+    from ens_toy_example.plot_style import apply_style
+
+    apply_style()
     protocol = json.loads((root / "protocol.json").read_text())
     if protocol["status"] != "complete":
         raise ValueError("Density experiment must be complete")
     seeds = protocol["args"]["seeds"]
     with np.load(root / "data.npz") as data:
         for filename, specs in (
-            ("density_cc_only", (("bounded", "full"), ("repository", "central"))),
-            ("full_w1_cc_only", (("repository", "full"), ("bounded", "full"))),
+            ("density_cc_only", (("bounded", "full"),)),
+            ("full_w1_cc_only", (("bounded", "full"),)),
         ):
-            fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True, constrained_layout=True)
+            fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
             draw_density(axes[0], data)
             for ax, (support, view) in zip(axes[1:], specs):
                 curves = []
@@ -37,12 +40,12 @@ def plot(root):
                         np.testing.assert_allclose(curve, saved["cc_pairs"].mean(0))
                         curves.append(curve)
                 values = np.stack(curves)
-                ax.plot(grid, values.mean(0), color="C1", lw=2, label="C-C: mean of 10 member pairs")
+                ax.plot(grid, values.mean(0), color="#D55E00", lw=2, label="C-C: mean of 10 member pairs")
                 ax.fill_between(
                     grid,
                     values.min(0),
                     values.max(0),
-                    color="C1",
+                    color="#D55E00",
                     alpha=0.2,
                     label="range across initialization repeats",
                 )
