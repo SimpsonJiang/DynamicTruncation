@@ -8,7 +8,7 @@ import test_value_ensemble as fixtures
 import torch
 from omegaconf import OmegaConf
 
-from physics_decoder import Float64Adam, OnlinePhysicsDecoder
+from reconstruction.decoder import Float64Adam, OnlinePhysicsDecoder
 
 SCHEMA = dict(nq=2, nv=2, na=0, joint_types=[3, 2], joint_addresses=[0, 1], joint_limited=[0, 1], task="test")
 
@@ -185,7 +185,7 @@ class SafetyAndReplayTest(CPUContractTest):
         self.assertFalse(explanation.break_reasons)
 
     def test_budget_refund_failed_actions_and_ratio(self):
-        from reconstruction import ReconstructionBudget
+        from reconstruction.controller import ReconstructionBudget
 
         cfg = OmegaConf.create(dict(ratio=0.1, max_active=2, branch_steps=64, max_consecutive=2, credit_cap_steps=128))
         b = ReconstructionBudget(cfg)
@@ -214,7 +214,7 @@ class SafetyAndReplayTest(CPUContractTest):
     def test_candidate_topk_diversity_expiry(self):
         import numpy as np
 
-        from reconstruction import Candidate, CandidatePool
+        from reconstruction.controller import Candidate, CandidatePool
 
         cfg = OmegaConf.create(
             dict(
@@ -247,7 +247,7 @@ class SafetyAndReplayTest(CPUContractTest):
         self.assertFalse(p.items)
 
     def test_guard_calibration_validation_freeze(self):
-        from reconstruction_guard import GuardCalibration
+        from reconstruction.guard import GuardCalibration
 
         c = GuardCalibration(dict(floors=[0.001, 0.002], signature="s"), 4, 4, 0.0)
         c.observe(dict(samples=[[0.01, 0], [0.02, 0]], violation=False), 4, "calibrate")
@@ -261,7 +261,7 @@ class SafetyAndReplayTest(CPUContractTest):
         import numpy as np
         from dm_control import suite
 
-        from reconstruction_guard import GeometryMonitor, UnsafeState
+        from reconstruction.guard import GeometryMonitor, UnsafeState
 
         a = suite.load("walker", "walk", task_kwargs={"random": 3})
         b = suite.load("walker", "walk", task_kwargs={"random": 3})
@@ -288,7 +288,7 @@ class SafetyAndReplayTest(CPUContractTest):
     def test_filtered_pairs_are_not_monitored(self):
         from dm_control import mujoco as dm_mujoco
 
-        from reconstruction_guard import GeometryMonitor
+        from reconstruction.guard import GeometryMonitor
 
         xml = """<mujoco><worldbody>
         <body pos="0 0 1"><freejoint/><geom type="sphere" size=".2" contype="1" conaffinity="1"/></body>
@@ -308,7 +308,7 @@ class SafetyAndReplayTest(CPUContractTest):
         import numpy as np
         from dm_control import mujoco as dm_mujoco
 
-        from reconstruction_guard import GeometryMonitor
+        from reconstruction.guard import GeometryMonitor
 
         physics = dm_mujoco.Physics.from_xml_string("""<mujoco><worldbody>
         <geom type="plane" size="2 2 .1"/>
@@ -363,7 +363,7 @@ class SafetyAndReplayTest(CPUContractTest):
         from dm_control import suite
 
         from envs import make_env
-        from reconstruction_guard import GeometryMonitor
+        from reconstruction.guard import GeometryMonitor
 
         for name in ("finger_spin", "hopper_hop", "quadruped_run", "walker_walk"):
             domain, task = name.split("_", 1)
@@ -392,7 +392,7 @@ class SafetyAndReplayTest(CPUContractTest):
             self.assertTrue(np.any(core != core.astype(np.float32).astype(np.float64)))
 
     def test_auxiliary_gradient_switch_is_exact(self):
-        from physics_decoder import OnlinePhysicsDecoder
+        from reconstruction.decoder import OnlinePhysicsDecoder
 
         fixtures.ValueEnsembleTest.setUpClass()
         fixture = fixtures.ValueEnsembleTest()
@@ -483,7 +483,7 @@ class SafetyAndReplayTest(CPUContractTest):
     def test_welded_parent_groups_are_excluded(self):
         from dm_control import mujoco as dm_mujoco
 
-        from reconstruction_guard import GeometryMonitor
+        from reconstruction.guard import GeometryMonitor
 
         xml = """<mujoco><worldbody><geom type="plane" size="2 2 .1"/>
           <body pos="0 0 1"><freejoint/><geom type="sphere" size=".2"/>

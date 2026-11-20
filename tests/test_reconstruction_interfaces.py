@@ -13,9 +13,9 @@ from tensordict import TensorDict
 from buffer import ReplayNotReady
 from dreamer import Dreamer
 from envs.parallel import ParallelEnv
-from envs.physics_protocol import EnvStepResult, PhysicsContext
-from physics_decoder import OnlinePhysicsDecoder
 from physics_probe.decoder import StateDecoder
+from reconstruction.decoder import OnlinePhysicsDecoder
+from reconstruction.protocol import EnvStepResult, PhysicsContext
 from trainer import OnlineTrainer
 
 
@@ -161,7 +161,7 @@ class ReconstructionInterfaceTest(unittest.TestCase):
     def test_geometry_hook_installation_has_one_owner_and_restores_original(self):
         from dm_control import mujoco as dm_mujoco
 
-        from reconstruction_guard import GeometryMonitor
+        from reconstruction.guard import GeometryMonitor
 
         physics = dm_mujoco.Physics.from_xml_string("""<mujoco><worldbody>
         <geom type="plane" size="1 1 .1"/><body pos="0 0 1"><freejoint/>

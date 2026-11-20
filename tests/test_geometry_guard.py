@@ -9,7 +9,7 @@ from dm_control import mujoco as dm_mujoco
 from omegaconf import OmegaConf
 
 from envs import make_env
-from reconstruction_guard import GeometryMonitor, UnsafeState
+from reconstruction.guard import GeometryMonitor, UnsafeState
 
 
 class GeometryFilterTest(unittest.TestCase):
@@ -24,7 +24,7 @@ class GeometryFilterTest(unittest.TestCase):
         physics = self.physics()
         guard = GeometryMonitor(physics, "allowed")
         self.assertEqual(guard.pairs, [(0, 1)])
-        with mock.patch("reconstruction_guard.mujoco.mj_geomDistance") as forced_distance:
+        with mock.patch("reconstruction.guard.mujoco.mj_geomDistance") as forced_distance:
             self.assertAlmostEqual(guard.depths()[0], 0.3)
         forced_distance.assert_not_called()
         guard.install_thresholds(guard.signature, [0.01])

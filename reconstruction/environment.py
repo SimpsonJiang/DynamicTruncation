@@ -5,7 +5,7 @@ import hashlib
 import gymnasium as gym
 import numpy as np
 
-from .physics_protocol import EnvStepResult, PhysicsContext
+from .protocol import EnvStepResult, PhysicsContext
 
 TASKS = ("finger_spin", "hopper_hop", "quadruped_run", "walker_walk")
 
@@ -49,12 +49,104 @@ class OnlinePhysicsEnv(gym.Wrapper):
     def online_step(self, action, reset=False):
         if reset:
             obs, reward, done = self.reset(), 0.0, False
+            self.policy_steps = 0
         else:
             obs, reward, done, _ = self.step(action)
+            self.policy_steps += 1
         return EnvStepResult(obs, reward, done, self.physics_labels())
 
+    def render_reconstructions(self, cores, actions, depths, size):
+        """Render predicted cores in a private model/data copy, with zero actions.
+
+        This diagnostic deliberately bypasses the branch guard, so poor or
+        rejected reconstructions remain visible. Invalid cells carry a failure.
+        """
+        import mujoco
+
+        cores, actions = np.asarray(cores), np.asarray(actions)
+        if cores.dtype != np.float64 or cores.shape != (len(depths), len(self.physics_labels())):
+            raise ValueError("Visualization cores must be float64 [depth, nq+nv+na]")
+        height, width = map(int, size)
+        state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+
+        def integration(physics):
+            state = np.empty(mujoco.mj_stateSize(physics.model.ptr, state_spec), dtype=np.float64)
+            mujoco.mj_getState(physics.model.ptr, physics.data.ptr, state, state_spec)
+            return state
+
+        before = integration(self.physics)
+        model_hash = hashlib.sha256(self.physics.model.to_bytes()).hexdigest()
+        source = dict(
+            time=float(self.physics.data.time),
+            policy_step=int(self.policy_steps),
+            context_vector=self.context_vector().tolist(),
+            core=self.physics_labels().tolist(),
+            model_hash=model_hash,
+        )
+        scratch = self.physics.copy(share_model=False)
+        images, details = [], []
+        try:
+            m, d = scratch.model, scratch.data
+            defaults = {
+                key: np.asarray(getattr(self.physics.data, key)).copy()
+                for key in (
+                    "qfrc_applied",
+                    "xfrc_applied",
+                    "mocap_pos",
+                    "mocap_quat",
+                    "userdata",
+                    "eq_active",
+                    "plugin_state",
+                )
+            }
+            for core, depth in zip(cores, depths):
+                detail = dict(depth=int(depth), actions_executed=0, failure=None)
+                pixels = np.zeros((height, width, 3), dtype=np.uint8)
+                try:
+                    if not np.isfinite(core).all():
+                        raise ValueError("nonfinite_core")
+                    for kind, address in zip(m.jnt_type, m.jnt_qposadr):
+                        if kind in (0, 1):
+                            start = int(address) + (3 if kind == 0 else 0)
+                            if abs(np.linalg.norm(core[start : start + 4]) - 1) > 1e-5:
+                                raise ValueError("invalid_quaternion")
+                    mujoco.mj_resetData(m.ptr, d.ptr)
+                    for key, value in defaults.items():
+                        getattr(d, key)[:] = value
+                    d.qpos[:], d.qvel[:], d.act[:] = core[: m.nq], core[m.nq : m.nq + m.nv], core[m.nq + m.nv :]
+                    d.time = source["time"] + int(depth) * self.base._env.control_timestep() * self.repeat
+                    d.ctrl[:] = self.physics.data.ctrl
+                    if depth:
+                        previous = actions[depth - 1].astype(np.float32)
+                        low, high = self.base.action_space.low, self.base.action_space.high
+                        d.ctrl[:] = (previous + 1) / 2 * (high - low) + low
+                    scratch.forward()
+                    restored = integration(scratch)
+                    pixels = scratch.render(height=height, width=width, camera_id=self.base._camera)
+                    np.testing.assert_array_equal(integration(scratch), restored)
+                    detail.update(time=float(d.time), render_state_unchanged=True)
+                except Exception as error:
+                    # Optional rendering errors must not terminate this RPC
+                    # worker and thereby take down the training collector.
+                    detail["failure"] = f"{type(error).__name__}: {error}"
+                images.append(pixels)
+                details.append(detail)
+        finally:
+            scratch.free()
+            np.testing.assert_array_equal(integration(self.physics), before)
+            if hashlib.sha256(self.physics.model.to_bytes()).hexdigest() != model_hash:
+                raise RuntimeError("Visualization changed the live physics model")
+        return dict(
+            images=np.stack(images),
+            details=details,
+            source=source,
+            camera_id=self.base._camera,
+            live_state_unchanged=True,
+            live_model_unchanged=True,
+        )
+
     def setup_guard(self):
-        from reconstruction_guard import GeometryMonitor, UnsafeState
+        from .guard import GeometryMonitor, UnsafeState
 
         if self._guard_profile is not None:
             return self._guard_profile
@@ -121,7 +213,7 @@ class OnlinePhysicsEnv(gym.Wrapper):
     def restore_branch(self, candidate):
         import mujoco
 
-        from reconstruction_guard import UnsafeState
+        from .guard import UnsafeState
 
         context, vector = candidate["context"], candidate["context_vector"]
         m, d = self.physics.model, self.physics.data
@@ -175,7 +267,7 @@ class OnlinePhysicsEnv(gym.Wrapper):
     def reconstruction_step(self, action, reset, request, phase, thresholds=None):
         from dm_control.rl.control import PhysicsError
 
-        from reconstruction_guard import UnsafeState
+        from .guard import UnsafeState
 
         report = dict(
             violation=False, samples=[], failure=None, failure_details=None, max_depth=0.0, branch=False, root=False

@@ -280,7 +280,7 @@ class Dreamer(nn.Module):
         physics_config = config.get("physics_decoder", {})
         self.physics_grad_to_wm = bool(physics_config.get("grad_to_wm", False))
         if physics_config.get("enabled", False):
-            from physics_decoder import Float64Adam, OnlinePhysicsDecoder
+            from reconstruction.decoder import Float64Adam, OnlinePhysicsDecoder
 
             self.physics_head = OnlinePhysicsDecoder(self.rssm.feat_size, physics_config)
             self.physics_optimizer = Float64Adam(self.physics_head.parameters(), lr=float(physics_config.lr))
@@ -459,6 +459,37 @@ class Dreamer(nn.Module):
             raise ValueError("Physics decoder is disabled")
         with autocast(device_type=self.device.type, enabled=False):
             return self.physics_head(torch.as_tensor(features, device=self.device))
+
+    @torch.no_grad()
+    def reconstruction_visualization(self, state, depths, seed):
+        """Decode one shared imagined trajectory through both visualization paths.
+
+        Use separate RNG state without updating normalizers, gradients or losses.
+        The caller supplies already observed current latents, not another obs_step.
+        """
+        if self.physics_head is None or self.rep_loss != "dreamer" or "image" not in self.decoder.cnn_shapes:
+            raise ValueError("Reconstruction visualization requires physics and native image decoders")
+        devices = []
+        if self.device.type == "cuda":
+            devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()]
+        with torch.random.fork_rng(devices=devices):
+            torch.random.default_generator.manual_seed(int(seed))
+            for device in devices:
+                torch.cuda.default_generators[device].manual_seed(int(seed))
+            with autocast(device_type=self.device.type, dtype=torch.float16):
+                features, actions = self._imagine(
+                    (state["stoch"].detach().clone(), state["deter"].detach().clone()), max(depths) + 1
+                )
+                selected = features[:, depths].clone()
+                stoch, deter = self.rssm.state_from_feat(selected)
+                native = self.decoder(stoch, deter)["image"].mode()
+            cores = self.decode_physics(selected)
+            return dict(
+                features=selected.cpu(),
+                actions=actions.cpu(),
+                predicted_core=cores.cpu(),
+                native_images=native.clamp(0, 1).mul(255).round().to(torch.uint8).cpu(),
+            )
 
     @torch.no_grad()
     def act_with_seeds(self, obs, state, seed_features, seed_actions):

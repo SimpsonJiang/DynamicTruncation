@@ -12,8 +12,7 @@ import torch
 from tensordict import TensorDict
 
 import tools
-
-from .physics_protocol import EnvStepResult
+from reconstruction.protocol import EnvStepResult
 
 
 class ParallelEnv:
@@ -87,6 +86,13 @@ class ParallelEnv:
 
     def physics_schema(self):
         return self.envs[0].physics_schema()()
+
+    def render_reconstructions(self, slots, cores, actions, depths, size):
+        promises = [
+            self.envs[slot].render_reconstructions(core, action, depths, size)
+            for slot, core, action in zip(slots, cores, actions)
+        ]
+        return [promise() for promise in promises]
 
     def online_step(self, action_np, done):
         promises = [e.online_step(a, bool(d)) for e, a, d in zip(self.envs, action_np, done)]

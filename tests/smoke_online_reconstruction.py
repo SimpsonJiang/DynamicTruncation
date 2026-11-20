@@ -18,7 +18,7 @@ from omegaconf import open_dict
 from buffer import Buffer
 from dreamer import Dreamer
 from envs import make_envs
-from reconstruction import Candidate, ReconstructionController
+from reconstruction.controller import Candidate, ReconstructionController
 
 
 def main():
@@ -71,7 +71,7 @@ def main():
     try:
         with open_dict(config.model.physics_decoder):
             config.model.physics_decoder.schema = envs.physics_schema()
-        from physics_decoder import OnlinePhysicsDecoder
+        from reconstruction.decoder import OnlinePhysicsDecoder
 
         if torch.device(args.device).type == "cuda":
             before = torch.cuda.get_rng_state(args.device)

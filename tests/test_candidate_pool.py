@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 from omegaconf import OmegaConf
 
-from reconstruction import Candidate, CandidatePool
+from reconstruction.controller import Candidate, CandidatePool
 
 
 class ScalarCandidatePool(CandidatePool):

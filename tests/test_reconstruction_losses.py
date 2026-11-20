@@ -7,7 +7,7 @@ import torch
 from omegaconf import OmegaConf
 
 from networks import barlow_loss
-from physics_decoder import OnlinePhysicsDecoder
+from reconstruction.decoder import OnlinePhysicsDecoder
 
 
 class ReconstructionLossTest(unittest.TestCase):

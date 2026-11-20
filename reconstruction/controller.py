@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from envs.physics_protocol import PhysicsContext
+from .protocol import PhysicsContext
 
 
 @dataclass
@@ -187,7 +187,7 @@ class ReconstructionController:
     """Coordinate existing environment slots; no extra collection environments."""
 
     def __init__(self, config, envs, replay, agent, action_repeat):
-        from reconstruction_guard import GuardCalibration
+        from .guard import GuardCalibration
 
         agent.configure_reconstruction(config)
         replay.enable_transactions()

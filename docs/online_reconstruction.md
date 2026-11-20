@@ -55,7 +55,7 @@ model.physics_decoder.enabled=true reconstruction.enabled=true
 
 ## 数据、精度与 checkpoint
 
-`envs/online_physics.py` 在 Dtype wrapper 之外，以独立 RPC 返回同一时刻的
+`reconstruction/environment.py` 在 Dtype wrapper 之外，以独立 RPC 返回同一时刻的
 `qpos + qvel + act`，存入 replay 的 `physics/core`，保留原始 float64。
 它不属于 observation space，encoder 和 actor 无法把标签作为观测输入。
 `physics/context` 只用于候选恢复；图片仍是原来的 uint8 数据。
@@ -153,6 +153,67 @@ Decoder 为两层 256 单元 SiLU MLP，Adam lr=1e-3，loss scale=1，梯度范�
 
 ## 验证入口
 
+### DMC vision 训练中的重建可视化
+
+`dmc_vision` 使用图像 encoder、Dreamer 原生 image decoder，并开启在线物理 decoder 时，
+训练默认每 **100,000 个控制台 Step** 生成一次并排图集。Step 与训练预算相同，汇总所有采集槽，
+包含 action repeat；不是优化器更新次数或单个环境的步数。首次在达到/越过100k时生成，随后为200k、300k……。
+该功能也支持 `dyn_rec=decoder_only`，不依赖重建 guard 放行。`dyn_rec=off` 没有物理 decoder，默认不生成。
+Proprio、其他环境套件，以及没有原生 image decoder 的 representation 不生成此图集。
+
+输出位于各自训练目录：
+
+```text
+reconstruction_visualization/
+  README.md
+  index.html
+  step_000100000/
+    comparison.png
+    README.md
+    manifest.json
+    samples.pt
+  step_000200000/
+    ...
+```
+
+每一对左侧是 **想象 feature → 在线物理 decoder → qpos/qvel/act → 仿真截图**，
+右侧是 **同一 feature → 原生 image decoder RGB**。默认四组列为想象第8、10、12、14步，
+每100k步进行 **5次想象重建实验，合成一张5行图片，每次实验占一行**。
+优先使用当前最前面的五个普通、非末帧环境槽，属于同一模型seed，不是五个模型seed。
+普通环境起点不足五个时循环使用可用起点，每行独立采样想象动作与潜在状态，仍做满五次；
+不会复制已生成的图片来补行，也不会额外创建采集环境。没有可用普通起点时延后到下一个可用采集帧。
+若想象 horizon 较短，保留可用的请求深度；全部不可用时展示 horizon 对应深度。
+不按 Advantage、重建误差或 guard 是否接受挑选样本。
+
+图集沿用 `physics_probe_stage5_three_groups_20261106/comparison_images` 的左右链路。
+区别是在线直接从采集器当前 posterior latent 生成一条共享想象轨迹，不读取旧离线 probe 权重，
+也不需要 proprio 的 observation→state 展示 decoder。左右都不是未来真实画面，图集不是固定测试集精度评估。
+
+物理截图使用对应采集 worker 的独立 model/data 副本，沿用相机 ID；只恢复预测核心状态，
+已知起点上下文中的时间与上一 control 依据想象深度/动作链解析推进，**不执行仿真动作**。
+渲染后核对真实环境 integration state 和 model 没有变化。想象使用隔离的 CPU/当前 CUDA RNG 状态，
+不更新模型参数、normalizer 或 replay，也不额外调用 `obs_step`。
+原生64×64像素用最近邻放大到320×320；物理截图保留原始320×320像素。
+
+穿模 guard 不参与静态图筛选，无效/渲染失败格明确标记并保留原因。
+完整共享feature、动作链、float64预测状态和两路像素保存在 `samples.pt`，相机、来源、真实训练Step、
+模型更新数和失败原因记录在 `manifest.json`。整次图集失败会写 `error.json` 并打印错误，训练继续；
+同一里程碑不会在后续每个采集步反复重试，也不会覆盖已有图集。
+
+可通过 Hydra 调整或关闭：
+
+```bash
+trainer.reconstruction_visualization.every=100000
+trainer.reconstruction_visualization.origins=5
+'trainer.reconstruction_visualization.depths=[8,10,12,14]'
+trainer.reconstruction_visualization.enabled=false
+```
+
+默认启用条件随 `model.physics_decoder.enabled`，随后进一步检查是否确实是 DMC vision。
+无需修改 proprio 的启动配置，也不会自动启用物理 decoder。修改只作用于新启动的训练进程。
+
+### 回归与接线检查
+
 ```bash
 TMPDIR=/mnt/phx2/tmp OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MUJOCO_GL=egl \
   .venv/bin/python -m unittest discover -s tests -p test_online_physics.py -v
@@ -161,6 +222,12 @@ TMPDIR=/mnt/phx2/tmp OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 
 TMPDIR=/mnt/phx2/tmp CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=6 \
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 PYTHONPATH=. .venv/bin/python tests/smoke_online_reconstruction.py
+
+# 小型图集/EGL验收：未训练CPU模型，五行、每行四对静态截图，不运行训练。
+# 先检查 GPU6 的实际占用；输出目录中 Step=2 是调度测试，非真实训练进度。
+TMPDIR=/mnt/phx2/tmp CUDA_VISIBLE_DEVICES=6 MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=6 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. \
+.venv/bin/python tests/smoke_reconstruction_visualization.py --output logdir/visualization_smoke
 ```
 
 接线测试用真实核心状态作为恢复成功路径的 oracle fixture；生产代码始终调用 learned decoder。
@@ -181,7 +248,10 @@ RSSM 的训练扫描不再按根标记执行 `nonzero`、动态缩小 batch 或 
 
 ## 模块接口与兼容性
 
-- `physics_state.py` 是在线/离线共用的状态编码与 MLP 底座，不依赖 probe、环境或训练器。
+截断重建的独立模块统一放在 [`reconstruction/`](../reconstruction/README.md) 包中，
+训练器、Dreamer、replay 和通用环境分发保留各自的接入点。包内模块与职责见该目录的 README。
+
+- `reconstruction/state.py` 是在线/离线共用的状态编码与 MLP 底座，不依赖 probe、环境或训练器。
   `physics_probe.decoder.StateCodec` 仍保留原导入路径；旧 probe 导出和主模型 state_dict 的参数键保持兼容。
 - 在线 decoder 使用自己的 `export()/from_export()`，格式标记为 `online_physics_mlp`，
   同时保存 EMA 和归一化超参数；离线 probe 继续使用其原有格式。

@@ -5,7 +5,7 @@ import copy
 import torch
 from torch import nn
 
-from physics_state import PhysicsDecoderBase, StateCodec
+from reconstruction.state import PhysicsDecoderBase, StateCodec
 
 __all__ = ["StateCodec", "StateDecoder", "ImageStateDecoder"]
 

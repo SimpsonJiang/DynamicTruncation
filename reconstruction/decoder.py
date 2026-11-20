@@ -7,7 +7,7 @@ import json
 import torch
 from omegaconf import OmegaConf
 
-from physics_state import PhysicsDecoderBase
+from .state import PhysicsDecoderBase
 
 
 class OnlinePhysicsDecoder(PhysicsDecoderBase):

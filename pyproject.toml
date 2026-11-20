@@ -34,7 +34,7 @@ all = ["r2dreamer[dmc,atari,crafter,metaworld,memorymaze,isaaclab]"]
 dev = ["pre-commit>=4"]
 
 [tool.setuptools.packages.find]
-include = ["envs*", "optim*"]
+include = ["envs*", "optim*", "reconstruction*"]
 
 [tool.uv]
 # Always applied globally (uv has no per-extra scoping), but only has

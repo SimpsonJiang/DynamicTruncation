@@ -1,0 +1,12 @@
+{
+  "fixture": "untrained CPU model; scheduler Step 2 is simulated, no training was run",
+  "training_updates": 0,
+  "actions_executed": 0,
+  "experiments": 5,
+  "paired_cells": 20,
+  "egl_device": "6",
+  "elapsed_seconds": 2.575614307075739,
+  "image": "analysis_outputs/reconstruction_visualization_20261120/egl_five_trials/reconstruction_visualization/step_000000002/comparison.png",
+  "rng_preserved": true,
+  "live_state_unchanged": true
+}

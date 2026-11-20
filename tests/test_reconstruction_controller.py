@@ -18,8 +18,8 @@ from tensordict import TensorDict
 from buffer import Buffer
 from envs import make_env
 from envs.parallel import ParallelEnv
-from reconstruction import Candidate, ReconstructionController
-from reconstruction_guard import UnsafeState
+from reconstruction.controller import Candidate, ReconstructionController
+from reconstruction.guard import UnsafeState
 from trainer import OnlineTrainer
 
 

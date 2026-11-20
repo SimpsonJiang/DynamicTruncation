@@ -107,7 +107,7 @@ def make_env(config, id, *, physics=False):
     time_limit = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
     env = wrappers.Dtype(time_limit)
     if physics:
-        from .online_physics import OnlinePhysicsEnv
+        from reconstruction.environment import OnlinePhysicsEnv
 
         env = OnlinePhysicsEnv(env, config, time_limit=time_limit)
     return env

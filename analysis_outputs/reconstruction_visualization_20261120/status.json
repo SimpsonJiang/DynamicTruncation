@@ -1,0 +1,61 @@
+{
+  "status": "complete",
+  "date": "2026-11-20",
+  "scope": "100k-Step paired reconstruction galleries for DMC vision only",
+  "defaults": {
+    "enabled_when": "online physics decoder enabled, DMC image encoder and native image decoder available",
+    "every_env_steps": 100000,
+    "origins": 5,
+    "depths": [8, 10, 12, 14],
+    "image_size": [320, 320],
+    "proprio_enabled": false
+  },
+  "artifacts": {
+    "run_gallery": "<training logdir>/reconstruction_visualization/README.md",
+    "run_html": "<training logdir>/reconstruction_visualization/index.html",
+    "checkpoint": "step_000100000/{comparison.png,README.md,manifest.json,samples.pt}"
+  },
+  "verification": {
+    "full_cpu_tests_passed": 193,
+    "full_cpu_tests_seconds": 79.351,
+    "focused_cpu_tests_passed": 39,
+    "new_tests": 9,
+    "egl_smoke_gpu": 6,
+    "egl_smoke_paired_cells": 4,
+    "egl_smoke_actions_executed": 0,
+    "egl_smoke_elapsed_seconds": 0.6739627351053059,
+    "egl_smoke_model": "untrained small CPU fixture",
+    "egl_smoke_image_visually_checked": true,
+    "shared_feature_and_cpu_rng_checked": true,
+    "live_mujoco_state_model_task_rng_checked": true,
+    "native_pixels_nearest_neighbor_checked": true,
+    "black": "passed; full related files and added Dreamer method",
+    "flake8": "passed; full related files and added Dreamer method",
+    "isort": "passed",
+    "git_diff_check": "passed",
+    "temporary_directory_preflight": "/mnt/phx2/tmp enforced on formal reruns"
+  },
+  "five_trial_revision": {
+    "experiments_per_sheet": 5,
+    "one_experiment_per_row": true,
+    "fewer_origins_behavior": "cycle available ordinary starting points; independently sample each imagined trajectory; never duplicate images",
+    "focused_cpu_tests_passed": 10,
+    "focused_cpu_seconds": 5.104,
+    "egl_gpu": 6,
+    "egl_experiments": 5,
+    "egl_paired_cells": 20,
+    "egl_sheet_pixels": [2624, 2160],
+    "egl_seconds": 2.575614307075739,
+    "egl_smoke_directory": "egl_five_trials",
+    "image_visually_checked": true,
+    "full_repository_suite_repeated": false
+  },
+  "limits": {
+    "trained_decoder_quality_evaluated": false,
+    "full_cuda_training_run": false,
+    "training_overhead_benchmarked": false,
+    "existing_training_restarted": false,
+    "launcher_task_settings_changed": false,
+    "proprio_display_decoder_added": false
+  }
+}

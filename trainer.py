@@ -30,6 +30,7 @@ class OnlineTrainer:
         self.reconstruction_config = config.get("reconstruction", {})
         self.logdir = logdir
         self._reconstruction_status = None
+        self.visualization_config = config.get("reconstruction_visualization", {})
 
     def write_reconstruction_diagnostics(self, reconstruction, *, final=False):
         """Persist diagnostics at the training boundary, not inside environment stepping."""
@@ -130,9 +131,12 @@ class OnlineTrainer:
         ``.to()`` is a no-op when the data is already on the target device.
         """
         envs = self.train_envs
+        from reconstruction.visualization import ReconstructionVisualizer
+
+        visualizer = ReconstructionVisualizer.create(self.visualization_config, agent, envs, self.logdir)
         reconstruction = None
         if self.reconstruction_config.get("enabled", False):
-            from reconstruction import ReconstructionController
+            from reconstruction.controller import ReconstructionController
 
             reconstruction = ReconstructionController(
                 self.reconstruction_config, envs, self.replay_buffer, agent, self._action_repeat
@@ -218,6 +222,8 @@ class OnlineTrainer:
                 reconstruction.record(trans, done)
                 episode_is_recon = trans["is_recon"].reshape(-1)
             returns += trans["reward"][:, 0]
+            if visualizer is not None:
+                visualizer.maybe_write(step, trans, agent_state)
             # Update models after enough data has accumulated
             if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
                 if self._should_pretrain():

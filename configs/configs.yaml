@@ -37,6 +37,14 @@ trainer:
   params_hist_log: False
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}
+  reconstruction_visualization:
+    enabled: ${model.physics_decoder.enabled}
+    task: ${env.task}
+    every: 100000
+    origins: 5
+    depths: [8, 10, 12, 14]
+    size: [320, 320]
+    seed: ${seed}
 
 # Both features are opt-in. These budgets are included in env.steps/train_ratio.
 reconstruction:
