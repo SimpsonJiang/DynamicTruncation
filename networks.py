@@ -390,6 +390,28 @@ class Projector(nn.Module):
         return self.w(x)
 
 
+def barlow_loss(x1, x2, lambd, valid=None):
+    """Sample-variance Barlow loss without data-dependent row/diagonal indexing."""
+    # Accumulate moments in float32 under AMP, and retain float64 when supplied.
+    dtype = torch.float32 if x1.dtype in (torch.float16, torch.bfloat16) else x1.dtype
+    x1, x2 = x1.to(dtype), x2.to(dtype)
+    mask = torch.ones_like(x1[:, :1], dtype=torch.bool) if valid is None else valid.reshape(-1, 1)
+    count = mask.to(dtype).sum()
+    normalized = []
+    for x in (x1, x2):
+        x = torch.where(mask, x, 0)
+        mean = x.sum(0) / count.clamp_min(1)
+        centered = torch.where(mask, x - mean, 0)
+        # vector_norm has a finite zero derivative for constant/empty columns.
+        std = torch.linalg.vector_norm(centered, dim=0) / (count - 1).clamp_min(1).sqrt()
+        normalized.append(centered / (std + 1e-8))
+    c = torch.mm(normalized[0].T, normalized[1]) / count.clamp_min(1)
+    diagonal = torch.diagonal(c)
+    off_diagonal = c - torch.diag_embed(diagonal)
+    loss = (diagonal - 1).square().sum() + lambd * off_diagonal.square().sum()
+    return torch.where(count >= 2, loss, 0)
+
+
 class ReturnEMA(nn.Module):
     """running mean and std"""
 

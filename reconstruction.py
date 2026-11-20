@@ -22,6 +22,8 @@ class Candidate:
 
 
 class CandidatePool:
+    _COMPARE_BLOCK_SIZE = 64
+
     def __init__(self, config, seed=0):
         self.config = config
         if (
@@ -31,7 +33,6 @@ class CandidatePool:
                 config.ttl_updates,
                 config.refresh_every_updates,
                 config.max_insert,
-                config.max_per_origin,
             )
             < 1
         ):
@@ -47,45 +48,70 @@ class CandidatePool:
 
     def insert(self, candidates, update, deter_mean, deter_scale, flat_stoch):
         self.expire(update)
+        ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+        valid = [
+            c
+            for c in ranked
+            if np.isfinite(c.score) and c.score > 0 and np.isfinite(c.feature).all() and np.isfinite(c.actions).all()
+        ]
+        if not valid:
+            self.items.sort(key=lambda c: c.score, reverse=True)
+            del self.items[self.config.capacity :]
+            self.stats["inserted"] += 0
+            return
+
+        old_count = len(self.items)
+        records = self.items + valid
+        # Decoder normalization changes online: cache within this call only.
+        coordinates = (np.stack([c.feature[flat_stoch:] for c in records]) - deter_mean) / deter_scale
+        norms = np.linalg.norm(coordinates, axis=1)
+        # Keep NumPy's original per-comparison promotion for mixed action dtypes.
+        actions = (
+            np.stack([c.actions[c.depth] for c in records]) if len({c.actions.dtype for c in records}) == 1 else None
+        )
+        alive = np.zeros(len(records), dtype=bool)
+        alive[:old_count] = True
         inserted = 0
-        for c in sorted(candidates, key=lambda c: c.score, reverse=True):
+        for start in range(0, len(valid), self._COMPARE_BLOCK_SIZE):
             if inserted >= self.config.max_insert:
                 break
-            if not np.isfinite(c.score) or c.score <= 0:
-                continue
-            if not np.isfinite(c.feature).all() or not np.isfinite(c.actions).all():
-                continue
-            duplicates = []
-            x = (c.feature[flat_stoch:] - deter_mean) / deter_scale
-            if self.items:
-                # One vectorized comparison, rather than O(capacity) Python/BLAS calls.
-                y = (np.stack([old.feature[flat_stoch:] for old in self.items]) - deter_mean) / deter_scale
-                xnorm, ynorm = np.linalg.norm(x), np.linalg.norm(y, axis=1)
-                cosine = (y @ x) / np.maximum(ynorm * xnorm, 1e-12)
-                cosine = np.where((xnorm < 1e-12) & (ynorm < 1e-12), 1.0, cosine)
-                actions = np.stack([old.actions[old.depth] for old in self.items])
-                rms = np.sqrt(np.mean((actions - c.actions[c.depth]) ** 2, axis=1))
-                near = (cosine >= self.config.deter_cosine_threshold) & (rms <= self.config.action_rms_threshold)
-                duplicates = [self.items[i] for i in np.flatnonzero(near)]
-                nearest = int(np.argmax(cosine))
-                self.stats["nearest_cosine_sum"] += float(cosine[nearest])
-                self.stats["nearest_action_rms_sum"] += float(rms[nearest])
-                self.stats["comparisons"] += 1
-            self.stats["considered"] += 1
-            if duplicates:
-                self.stats["merged"] += 1
-                if max(v.score for v in duplicates) >= c.score:
-                    continue
-                ids = {id(v) for v in duplicates}
-                self.items = [v for v in self.items if id(v) not in ids]
-            same = [v for v in self.items if v.origin == c.origin]
-            if len(same) >= self.config.max_per_origin:
-                worst = min(same, key=lambda v: v.score)
-                if worst.score >= c.score:
-                    continue
-                self.items = [v for v in self.items if v is not worst]
-            self.items.append(c)
-            inserted += 1
+            stop = min(start + self._COMPARE_BLOCK_SIZE, len(valid))
+            limit = old_count + stop
+            query = slice(old_count + start, old_count + stop)
+            cosine = (coordinates[:limit] @ coordinates[query].T) / np.maximum(
+                norms[:limit, None] * norms[None, query], 1e-12
+            )
+            cosine = np.where((norms[:limit, None] < 1e-12) & (norms[None, query] < 1e-12), 1.0, cosine)
+            for column, position in enumerate(range(start, stop)):
+                if inserted >= self.config.max_insert:
+                    break
+                c = valid[position]
+                duplicates = np.empty(0, dtype=int)
+                # Future/rejected candidates are never part of the current pool.
+                active = np.flatnonzero(alive[:limit])
+                if len(active):
+                    scores = cosine[active, column]
+                    previous_actions = (
+                        actions[active]
+                        if actions is not None
+                        else np.stack([records[j].actions[records[j].depth] for j in active])
+                    )
+                    rms = np.sqrt(np.mean((previous_actions - c.actions[c.depth]) ** 2, axis=1))
+                    near = (scores >= self.config.deter_cosine_threshold) & (rms <= self.config.action_rms_threshold)
+                    duplicates = active[near]
+                    nearest = int(np.argmax(scores))
+                    self.stats["nearest_cosine_sum"] += float(scores[nearest])
+                    self.stats["nearest_action_rms_sum"] += float(rms[nearest])
+                    self.stats["comparisons"] += 1
+                self.stats["considered"] += 1
+                if len(duplicates):
+                    self.stats["merged"] += 1
+                    if max(records[j].score for j in duplicates) >= c.score:
+                        continue
+                    alive[duplicates] = False
+                alive[old_count + position] = True
+                inserted += 1
+        self.items = [records[j] for j in np.flatnonzero(alive)]
         self.items.sort(key=lambda c: c.score, reverse=True)
         del self.items[self.config.capacity :]
         self.stats["inserted"] += inserted
@@ -177,12 +203,37 @@ class ReconstructionController:
         self.contexts, self.slot_origins, self.next_origin = {}, {}, 0
         self.active_candidates, self.stats = {}, Counter()
         self.sent_thresholds = False
+        self._rejections = []
 
     def _request(self, candidate, length):
         timeline = PhysicsContext.from_vector(candidate.context_vector)
         advanced = timeline.advance(candidate.depth, candidate.actions, candidate.context)
         core = self.agent.decode_physics(candidate.feature).cpu().numpy()
         return dict(context=candidate.context, context_vector=advanced.to_vector(), core=core, length=length)
+
+    def _start_branch(self, slot, candidate, length):
+        request = self._request(candidate, length)
+        self.budget.reserve(slot, length)
+        self.active_candidates[slot] = candidate
+        self.stats["restore_attempts"] += 1
+        return request
+
+    def _finish_branch(self, slot, *, commit=False, fallback=None):
+        """Complete replay, budget and candidate cleanup together, exactly once."""
+        if commit:
+            if self.replay.commit(slot):
+                self.stats["committed_branches"] += 1
+            else:
+                self.stats["discarded_branches"] += 1
+                self.stats["reject/ring_overwrite"] += 1
+        else:
+            started = self.replay.has_pending(slot)
+            self.replay.discard(slot)
+            self.stats["discarded_branches" if started else "rejected_restores"] += 1
+        self.budget.finish(slot)
+        self.active_candidates.pop(slot)
+        if fallback is not None:
+            self.budget.ordinary_reset(slot, fallback)
 
     def _schedule(self, done, env_step):
         requests = [None] * self.envs.env_num
@@ -201,10 +252,7 @@ class ReconstructionController:
                     timeline = PhysicsContext.from_vector(candidate.context_vector)
                     length = min(length, timeline.remaining_steps(candidate.context, candidate.depth))
                     if length > 0:
-                        requests[slot] = self._request(candidate, length)
-                        self.stats["restore_attempts"] += 1
-                        self.budget.reserve(slot, length)
-                        self.active_candidates[slot] = candidate
+                        requests[slot] = self._start_branch(slot, candidate, length)
                     else:
                         reason = "source_time_limit"
             if requests[slot] is None:
@@ -212,6 +260,7 @@ class ReconstructionController:
         return requests
 
     def step(self, actions, done, env_step):
+        done = done.cpu()
         requests = self._schedule(done, env_step)
         ordinary, reconstructed = 0, 0
         for slot, available in enumerate(done.tolist()):
@@ -228,11 +277,11 @@ class ReconstructionController:
         phase = self.guard.phase
         trans, next_done, reports, contexts = self.envs.reconstruction_step(actions, done, requests, phase, thresholds)
         self.budget.account(ordinary, reconstructed)
-        self._process_results(trans, done, reports, contexts, phase)
+        self._process_results(trans, done, reports, contexts, phase, env_step)
         self.reports = reports
         return trans, next_done
 
-    def _process_results(self, trans, done, reports, contexts, phase):
+    def _process_results(self, trans, done, reports, contexts, phase, env_step):
         roots, recon = [], []
         for slot, report in enumerate(reports):
             if report.get("guard_failure"):
@@ -241,13 +290,18 @@ class ReconstructionController:
                 self.guard.observe(report, self.repeat, phase)
             if report["failure"]:
                 self.stats["reject/" + report["failure"]] += 1
+                candidate = self.active_candidates.get(slot)
+                self._rejections.append(
+                    dict(
+                        **(report.get("failure_details") or {}),
+                        reason=report["failure"],
+                        slot=slot,
+                        env_step=int(env_step),
+                        origin=list(candidate.origin) if candidate is not None else None,
+                    )
+                )
                 if slot in self.budget.active:
-                    started = self.replay.has_pending(slot)
-                    self.replay.discard(slot)
-                    self.budget.finish(slot)
-                    self.active_candidates.pop(slot, None)
-                    self.stats["discarded_branches" if started else "rejected_restores"] += 1
-                    self.budget.ordinary_reset(slot, "rejected")
+                    self._finish_branch(slot, fallback="rejected")
             root = report["root"] and not report["failure"]
             is_recon = report["branch"] and not report["failure"]
             roots.append(root)
@@ -281,6 +335,10 @@ class ReconstructionController:
     def guard_profile(self):
         return self.guard.export()
 
+    def take_rejections(self):
+        events, self._rejections = self._rejections, []
+        return events
+
     def act(self, trans, state):
         root = trans["is_branch"].reshape(-1)
         candidates = [self.active_candidates[i] for i in root.nonzero().flatten().tolist()]
@@ -298,13 +356,7 @@ class ReconstructionController:
                 self.contexts[key] = (self.replay.generation, self.contexts[key][1])
         for slot in list(self.budget.active):
             if done[slot]:
-                if self.replay.commit(slot):
-                    self.stats["committed_branches"] += 1
-                else:
-                    self.stats["discarded_branches"] += 1
-                    self.stats["reject/ring_overwrite"] += 1
-                self.budget.finish(slot)
-                self.active_candidates.pop(slot, None)
+                self._finish_branch(slot, commit=True)
         # Episode contexts are shared, not duplicated with every image/latent row.
         horizon = self.replay.retention_frames(self.envs.env_num) + self.config.branch_steps
         live = set(self.slot_origins.values()) | {c.origin[0] for c in self.pool.items}
@@ -363,6 +415,4 @@ class ReconstructionController:
 
     def close(self):
         for slot in list(self.budget.active):
-            self.replay.discard(slot)
-            self.budget.finish(slot)
-            self.stats["discarded_branches"] += 1
+            self._finish_branch(slot)

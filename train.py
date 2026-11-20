@@ -20,6 +20,16 @@ torch.set_float32_matmul_precision("high")
 
 @hydra.main(version_base=None, config_path="configs", config_name="configs")
 def main(config):
+    physics_enabled = bool(config.model.get("physics_decoder", {}).get("enabled", False))
+    if config.get("reconstruction", {}).get("enabled", False):
+        truncation = config.model.get("dynamic_trunc", {})
+        Dreamer.validate_reconstruction_requirements(
+            physics_enabled=physics_enabled,
+            truncation_enabled=bool(truncation.get("enabled", True)),
+            rep_loss=str(config.model.rep_loss),
+            min_horizon=truncation.get("min_horizon", 8),
+            imag_horizon=int(config.model.imag_horizon),
+        )
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()
@@ -39,9 +49,6 @@ def main(config):
     replay_buffer = Buffer(config.buffer)
 
     print("Create envs.")
-    physics_enabled = bool(config.model.get("physics_decoder", {}).get("enabled", False))
-    if config.get("reconstruction", {}).get("enabled", False) and not physics_enabled:
-        raise ValueError("reconstruction.enabled requires model.physics_decoder.enabled")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env, physics=physics_enabled)
     if physics_enabled:
         from omegaconf import open_dict

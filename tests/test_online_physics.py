@@ -223,7 +223,6 @@ class SafetyAndReplayTest(CPUContractTest):
                 refresh_every_updates=8,
                 ttl_updates=8,
                 max_insert=20,
-                max_per_origin=2,
                 deter_cosine_threshold=0.98,
                 action_rms_threshold=0.1,
             )
@@ -286,11 +285,10 @@ class SafetyAndReplayTest(CPUContractTest):
         with self.assertRaisesRegex(UnsafeState, "nonfinite"):
             guard.check()
 
-    def test_filtered_pairs_and_transient_substep(self):
-        import numpy as np
+    def test_filtered_pairs_are_not_monitored(self):
         from dm_control import mujoco as dm_mujoco
 
-        from reconstruction_guard import GeometryMonitor, UnsafeState
+        from reconstruction_guard import GeometryMonitor
 
         xml = """<mujoco><worldbody>
         <body pos="0 0 1"><freejoint/><geom type="sphere" size=".2" contype="1" conaffinity="1"/></body>
@@ -299,13 +297,26 @@ class SafetyAndReplayTest(CPUContractTest):
         physics = dm_mujoco.Physics.from_xml_string(xml)
         guard = GeometryMonitor(physics, "filtered")
         guard.install_hook()
-        self.assertEqual(guard.pairs, [(0, 1)])
+        self.assertEqual(guard.pairs, [])
         self.assertEqual(physics.data.ncon, 0)
-        self.assertGreater(guard.depths()[0], 0.2)
-        guard.install_thresholds(guard.signature, [0.01])
+        self.assertEqual(guard.depths().size, 0)
+        guard.install_thresholds(guard.signature, [])
         guard.begin_policy_step("branch")
-        with self.assertRaisesRegex(UnsafeState, "penetration"):
-            guard.check()
+        guard.check()
+
+    def test_transient_substep_violation_is_recorded(self):
+        import numpy as np
+        from dm_control import mujoco as dm_mujoco
+
+        from reconstruction_guard import GeometryMonitor
+
+        physics = dm_mujoco.Physics.from_xml_string("""<mujoco><worldbody>
+        <geom type="plane" size="2 2 .1"/>
+        <body pos="0 0 1"><freejoint/><geom type="sphere" size=".2"/></body>
+        </worldbody></mujoco>""")
+        guard = GeometryMonitor(physics, "transient")
+        guard.install_hook()
+        guard.install_thresholds(guard.signature, [0.01])
         # Validate every substep: a violation that vanishes before policy observation still counts.
         guard.begin_policy_step("validate")
         calls = []

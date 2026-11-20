@@ -1,0 +1,45 @@
+{
+  "status": "complete",
+  "date": "2026-11-19",
+  "scope": "F1-F4 from reconstruction_review_20261117",
+  "fixes": {
+    "F1": "shared early Python and actual-model reconstruction dependency checks",
+    "F2": "fixed-shape R2 and physics losses, masked EMA, validation outside compiled update",
+    "F3": "structured rejection details persisted once to reconstruction_rejections.jsonl",
+    "F4": "central branch lifecycle cleanup and seven real-environment/replay CPU cooperation tests"
+  },
+  "verification": {
+    "full_unittest_passed": 184,
+    "full_unittest_seconds": 82.143,
+    "new_regression_tests": 18,
+    "r2_loss_graphs_across_masks": 1,
+    "physics_loss_graphs_across_masks": 1,
+    "graph_probe_backend": "eager GraphModule with fullgraph=True and counting backend",
+    "valid_row_counts": [0, 1, 3, 6, 2, 0],
+    "black_complete_files": 10,
+    "flake8_complete_files": 10,
+    "flake8_changed_lines_only": ["dreamer.py", "networks.py"],
+    "isort_files": 12,
+    "git_diff_check": "passed",
+    "unittest_log": "unittest.log"
+  },
+  "resources": {
+    "cpu_affinity": [88],
+    "nice": 19,
+    "omp_threads": 1,
+    "mkl_threads": 1,
+    "openblas_threads": 1,
+    "tmpdir": "/mnt/phx2/tmp",
+    "remaining_formatter_cli_processes": 0
+  },
+  "limits": {
+    "gpu_workload_run": false,
+    "cuda_inductor_timing_run": false,
+    "whole_update_single_graph_verified": false,
+    "training_run_started": false,
+    "existing_training_restarted": false,
+    "launcher_configuration_modified": false,
+    "learned_decoder_accuracy_evaluated": false,
+    "amp_r2_bitwise_parity_claimed": false
+  }
+}

@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from buffer import ReplayNotReady
+from dreamer import Dreamer
 from envs.parallel import ParallelEnv
 from envs.physics_protocol import EnvStepResult, PhysicsContext
 from physics_decoder import OnlinePhysicsDecoder
@@ -22,6 +23,56 @@ class ReconstructionInterfaceTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
         torch.set_num_threads(1)
+
+    def test_reconstruction_requirements_reject_inoperative_configurations(self):
+        valid = dict(physics_enabled=True, truncation_enabled=True, rep_loss="dreamer", min_horizon=8, imag_horizon=15)
+        Dreamer.validate_reconstruction_requirements(**valid)
+        for override, message in (
+            ({"physics_enabled": False}, "physics_decoder.enabled"),
+            ({"truncation_enabled": False}, "dynamic_trunc.enabled"),
+            ({"min_horizon": 15}, "min_horizon < imag_horizon"),
+            ({"min_horizon": 16}, "min_horizon < imag_horizon"),
+            ({"rep_loss": "infonce"}, "representations"),
+        ):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, message):
+                Dreamer.validate_reconstruction_requirements(**{**valid, **override})
+
+    def test_direct_model_configuration_checks_actual_model_settings(self):
+        fixtures.ValueEnsembleTest.setUpClass()
+        fixture = fixtures.ValueEnsembleTest()
+        agent = fixture.make_agent(trunc_enabled=False, min_horizon=1)
+        agent.physics_head = torch.nn.Identity()
+        with self.assertRaisesRegex(ValueError, "dynamic_trunc.enabled"):
+            agent.configure_reconstruction(OmegaConf.create({}))
+        self.assertIsNone(agent.reconstruction_config)
+        agent = fixture.make_agent(trunc_enabled=True, min_horizon=1)
+        agent.physics_head = torch.nn.Identity()
+        config = OmegaConf.create({})
+        agent.configure_reconstruction(config)
+        self.assertIs(agent.reconstruction_config, config)
+
+    def test_training_rejects_invalid_reconstruction_before_environment_or_seed_setup(self):
+        import train
+
+        config = OmegaConf.create(
+            dict(
+                reconstruction=dict(enabled=True),
+                model=dict(
+                    physics_decoder=dict(enabled=True),
+                    dynamic_trunc=dict(enabled=False, min_horizon=8),
+                    imag_horizon=15,
+                    rep_loss="dreamer",
+                ),
+            )
+        )
+        with (
+            mock.patch.object(train, "make_envs") as make_envs,
+            mock.patch.object(train.tools, "set_seed_everywhere") as seed,
+        ):
+            with self.assertRaisesRegex(ValueError, "dynamic_trunc.enabled"):
+                train.main.__wrapped__(config)
+        make_envs.assert_not_called()
+        seed.assert_not_called()
 
     def test_online_export_roundtrip_and_resume_statistics(self):
         schema = dict(nq=2, nv=2, na=0, joint_types=[3, 2], joint_addresses=[0, 1], joint_limited=[0, 1], task="test")

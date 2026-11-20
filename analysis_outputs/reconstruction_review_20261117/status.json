@@ -1,0 +1,92 @@
+{
+  "status": "review_complete",
+  "date": "2026-11-17",
+  "scope": "truncation reconstruction implementation and cross-module contracts",
+  "head": "d0741691f71c024207bde9aa34aefdb586e9b572",
+  "preexisting_worktree_changes": true,
+  "production_code_modified": false,
+  "training_run": false,
+  "gpu_workload_run": false,
+  "resources": {
+    "cpu_affinity": [88],
+    "nice": 19,
+    "omp_threads": 1,
+    "mkl_threads": 1,
+    "openblas_threads": 1,
+    "cuda_visible_devices": "",
+    "tmpdir": "/mnt/phx2/tmp"
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "priority": "P2",
+      "classification": "confirmed_configuration_validation_gap",
+      "summary": "Python reconstruction configuration accepts disabled dynamic truncation, yielding no candidates"
+    },
+    {
+      "id": "F2",
+      "priority": "P2",
+      "classification": "confirmed_local_graph_breaks_optional_paths",
+      "summary": "R2 row compaction and joint physics loss retain dynamic indexing inside compilation",
+      "whole_update_graph_count_measured": false,
+      "gpu_slowdown_measured": false
+    },
+    {
+      "id": "F3",
+      "priority": "P2",
+      "classification": "confirmed_diagnostic_gap",
+      "summary": "Penetration rejection drops the violating geom pair, depth, threshold and branch step"
+    },
+    {
+      "id": "F4",
+      "priority": null,
+      "classification": "maintainability_and_controller_test_coverage_risk",
+      "summary": "Branch lifecycle cleanup is distributed across components and lacks automatic controller integration tests",
+      "state_consistency_bug_reproduced": false
+    }
+  ],
+  "checks": {
+    "related_cpu_unittests": {
+      "passed": 53,
+      "failures": 0,
+      "errors": 0,
+      "duration_seconds": 16.443,
+      "modules": [
+        "test_candidate_pool",
+        "test_geometry_guard",
+        "test_online_physics",
+        "test_reconstruction_interfaces",
+        "test_replay_latent_storage"
+      ]
+    },
+    "disabled_truncation_reconstruction_probe": {
+      "accepted": true,
+      "packet_generated": false
+    },
+    "r2_exact_compaction_operation_cpu_dynamo": {
+      "graph_count": 2,
+      "graph_break_count": 1,
+      "break_reason": "aten.nonzero.default dynamic output shape"
+    },
+    "actual_physics_training_loss_cpu_dynamo": {
+      "graph_count": 4,
+      "graph_break_count": 3,
+      "break_reasons": [
+        "generic_jump TensorVariable()",
+        "aten.nonzero.default dynamic output shape",
+        "aten.nonzero.default dynamic output shape"
+      ]
+    },
+    "full_repository_suite_run": false,
+    "manual_gpu_smoke_run": false,
+    "cuda_timing_run": false
+  },
+  "current_verified_settings": {
+    "max_false_reject": 0.01,
+    "branch_penetration_policy_steps": 5,
+    "respect_mujoco_collision_filters": true,
+    "candidate_origin_quota": false,
+    "uv_run_dyn_rec": "off",
+    "run_dyn_rec": "on"
+  }
+}

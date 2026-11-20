@@ -36,10 +36,15 @@ class OnlineTrainer:
         directory = Path(self.logdir)
         directory.mkdir(parents=True, exist_ok=True)
         status = reconstruction.guard_status
-        if status != self._reconstruction_status:
+        if status != self._reconstruction_status or final:
             (directory / "reconstruction_guard.json").write_text(json.dumps(reconstruction.guard_profile(), indent=2))
             print("Reconstruction guard:", status, flush=True)
             self._reconstruction_status = status
+        events = reconstruction.take_rejections()
+        if events:
+            with (directory / "reconstruction_rejections.jsonl").open("a") as output:
+                for event in events:
+                    output.write(json.dumps(event) + "\n")
         if final:
             (directory / "reconstruction_summary.json").write_text(json.dumps(reconstruction.metrics(), indent=2))
 

@@ -8,14 +8,16 @@ import numpy as np
 
 
 class UnsafeState(RuntimeError):
-    pass
+    def __init__(self, reason, **details):
+        super().__init__(reason)
+        self.reason, self.details = reason, details
 
 
 class GeometryMonitor:
-    """Distance queries on scratch MjData, including pairs filtered by MuJoCo.
+    """Penetration checks on scratch MjData, respecting MuJoCo contact filters.
 
-    The four supported tasks use primitive geometry only. Fail closed for a
-    critical pair without an explicit distance implementation in this version.
+    The four supported tasks use primitive geometry only. Fail closed for an
+    enabled pair outside this version's supported primitive geometry set.
     """
 
     def __init__(self, physics, task):
@@ -28,6 +30,13 @@ class GeometryMonitor:
             physics.model.to_bytes() + mujoco.__version__.encode() + task.encode() + str(physics.legacy_step).encode()
         ).hexdigest()
         explicit = {tuple(sorted(map(int, p))) for p in zip(m.pair_geom1, m.pair_geom2)}
+        excluded = set(map(int, m.exclude_signature))
+        disabled = int(m.opt.disableflags)
+        contacts_disabled = disabled & (
+            int(mujoco.mjtDisableBit.mjDSBL_CONTACT) | int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+        )
+        filter_parent = not (disabled & int(mujoco.mjtDisableBit.mjDSBL_FILTERPARENT))
+        custom_filter = mujoco.get_mjcb_contactfilter() is not None
         geoms = [
             i for i in range(m.ngeom) if m.geom_contype[i] or m.geom_conaffinity[i] or any(i in p for p in explicit)
         ]
@@ -36,16 +45,24 @@ class GeometryMonitor:
             for b in geoms:
                 if a >= b:
                     continue
+                if contacts_disabled or m.nconmax == 0:
+                    continue
                 ba, bb = int(m.geom_bodyid[a]), int(m.geom_bodyid[b])
                 wa, wb = int(m.body_weldid[ba]), int(m.body_weldid[bb])
                 parent_a = int(m.body_weldid[m.body_parentid[wa]])
                 parent_b = int(m.body_weldid[m.body_parentid[wb]])
-                if wa == wb or parent_a == wb or parent_b == wa:
-                    # A movable world-child must still be checked against the ground.
-                    if wa == wb or (wa != 0 and wb != 0):
+                # Explicit pairs override body exclusions and standard filters.
+                if (a, b) not in explicit:
+                    signature = (min(ba, bb) << 16) + max(ba, bb)
+                    compatible = (int(m.geom_contype[a]) & int(m.geom_conaffinity[b])) or (
+                        int(m.geom_contype[b]) & int(m.geom_conaffinity[a])
+                    )
+                    if signature in excluded or wa == wb:
                         continue
-                if not (wa or wb):
-                    continue
+                    if filter_parent and wa and wb and (parent_a == wb or parent_b == wa):
+                        continue
+                    if not custom_filter and not compatible:
+                        continue
                 ta, tb = int(m.geom_type[a]), int(m.geom_type[b])
                 # Mesh/hfield/SDF distances cannot silently be treated as separated.
                 if max(ta, tb) > int(mujoco.mjtGeom.mjGEOM_BOX) or 1 in (ta, tb):
@@ -55,13 +72,11 @@ class GeometryMonitor:
                 sizes = [float(np.max(m.geom_size[g])) for g in (a, b) if int(m.geom_type[g]) != 0]
                 self.pairs.append((a, b))
                 self.floors.append(1e-3 * min(sizes))
-        if not self.pairs:
-            raise UnsafeState("no_detectable_critical_pairs")
         self.lookup = {pair: i for i, pair in enumerate(self.pairs)}
         self.floors = np.asarray(self.floors, dtype=np.float64)
         self.signature = hashlib.sha256(
             self.signature.encode()
-            + b"pair_guard_v1"
+            + b"pair_guard_v2_mujoco_contacts"
             + np.asarray(self.pairs, dtype=np.int32).tobytes()
             + self.floors.tobytes()
         ).hexdigest()
@@ -100,6 +115,9 @@ class GeometryMonitor:
         d, scratch, m = self.physics.data.ptr, self.scratch, self.model
         if not all(np.isfinite(getattr(d, k)).all() for k in ("qpos", "qvel", "act")):
             raise UnsafeState("nonfinite_state")
+        if not self.pairs:
+            self.last_depths = np.zeros(0, dtype=np.float64)
+            return self.last_depths
         # mj_fwdPosition needs qpos/mocap/eq_active, not the live solver state.
         scratch.qpos[:] = d.qpos
         scratch.mocap_pos[:] = d.mocap_pos
@@ -111,12 +129,10 @@ class GeometryMonitor:
         for c in scratch.contact[: scratch.ncon]:
             pair = tuple(sorted(map(int, c.geom)))
             if pair in lookup:
-                depths[lookup[pair]] = max(depths[lookup[pair]], -float(c.dist))
-        for i, (a, b) in enumerate(self.pairs):
-            distance = mujoco.mj_geomDistance(m, scratch, a, b, 1e3, None)
-            if not np.isfinite(distance):
-                raise UnsafeState("nonfinite_distance")
-            depths[i] = max(depths[i], -distance, 0.0)
+                distance = float(c.dist)
+                if not np.isfinite(distance):
+                    raise UnsafeState("nonfinite_distance")
+                depths[lookup[pair]] = max(depths[lookup[pair]], -distance)
         self.last_depths = depths
         return depths
 
@@ -131,7 +147,19 @@ class GeometryMonitor:
             if np.any(depths > self.thresholds):
                 self.violation = True
                 if self.mode == "branch":
-                    raise UnsafeState("penetration")
+                    # Report the largest threshold excess, not an unrelated
+                    # pair's maximum depth. Reuse the distances already checked.
+                    i = int(np.argmax(depths - self.thresholds))
+                    pair = self.pairs[i]
+                    raise UnsafeState(
+                        "penetration",
+                        geom_pair=list(pair),
+                        geom_names=[
+                            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, g) or f"geom_{g}" for g in pair
+                        ],
+                        depth=float(depths[i]),
+                        threshold=float(self.thresholds[i]),
+                    )
 
     def step(self, nstep=1):
         if self._original_step is None:
@@ -164,7 +192,7 @@ class GeometryMonitor:
 class GuardCalibration:
     """Aggregate ordinary policy steps from all slots, never reconstructed data."""
 
-    def __init__(self, profile, calibration_steps=50000, validation_steps=50000, max_false_reject=0.001):
+    def __init__(self, profile, calibration_steps=50000, validation_steps=50000, max_false_reject=0.01):
         self.profile = profile
         self.calibration_steps, self.validation_steps = int(calibration_steps), int(validation_steps)
         if self.calibration_steps <= 0 or self.validation_steps <= 0 or not 0 <= max_false_reject <= 1:

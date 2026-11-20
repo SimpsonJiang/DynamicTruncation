@@ -58,50 +58,66 @@ class OnlinePhysicsDecoder(PhysicsDecoderBase):
             raise ValueError("Nonfinite physics label")
 
     @torch.no_grad()
-    def update_statistics(self, inputs, core):
+    def update_statistics(self, inputs, core, valid=None):
         if not self.training:
             return
         x, y = inputs.detach().double(), self.codec.encode(core.detach())
+        mask = torch.ones_like(x[:, :1], dtype=torch.bool) if valid is None else valid.reshape(-1, 1)
+        count = mask.double().sum()
+        has_rows = count > 0
         decay = torch.where(
             self.norm_updates > 0, self.input_mean.new_tensor(self.decay), self.input_mean.new_zeros(())
         )
         for name, values in (("input", x), ("target", y)):
             mean, second = getattr(self, name + "_mean"), getattr(self, name + "_second")
-            mean.lerp_(values.mean(0), 1 - decay)
-            second.lerp_(values.square().mean(0), 1 - decay)
-            getattr(self, name + "_scale").copy_((second - mean.square()).clamp_min(0).sqrt().clamp_min(self.eps))
+            batch_mean = torch.where(mask, values, 0).sum(0) / count.clamp_min(1)
+            batch_second = torch.where(mask, values.square(), 0).sum(0) / count.clamp_min(1)
+            mean.copy_(torch.where(has_rows, torch.lerp(mean, batch_mean, 1 - decay), mean))
+            second.copy_(torch.where(has_rows, torch.lerp(second, batch_second, 1 - decay), second))
+            scale = getattr(self, name + "_scale")
+            updated_scale = (second - mean.square()).clamp_min(0).sqrt().clamp_min(self.eps)
+            scale.copy_(torch.where(has_rows, updated_scale, scale))
         for i in self.codec.quaternions:
-            self.target_mean[i : i + 4] = 0
-            self.target_scale[i : i + 4] = 1
+            self.target_mean[i : i + 4] = torch.where(has_rows, 0, self.target_mean[i : i + 4])
+            self.target_scale[i : i + 4] = torch.where(has_rows, 1, self.target_scale[i : i + 4])
         for j, i in enumerate(self.codec.periodic):
-            self.target_mean[[i, self.codec.core_dim + j]] = 0
-            self.target_scale[[i, self.codec.core_dim + j]] = 1
-        self.norm_updates.add_(1)
+            indices = [i, self.codec.core_dim + j]
+            self.target_mean[indices] = torch.where(has_rows, 0, self.target_mean[indices])
+            self.target_scale[indices] = torch.where(has_rows, 1, self.target_scale[indices])
+        self.norm_updates.add_(has_rows.long())
 
-    def loss(self, inputs, cores):
+    def loss(self, inputs, cores, valid=None):
         # Online coordinates are all active. Static schema groups avoid a GPU
         # scalar read per coordinate in the offline probe's variable-active loss.
         prediction = self.encoded_prediction(inputs)
         target = self.codec.encode(cores)
         squared = ((prediction - target) / self.target_scale).square()
-        terms = [squared[..., indices].mean() for indices in self.loss_groups if indices]
+        mask = torch.ones_like(squared[..., :1], dtype=torch.bool) if valid is None else valid.reshape(-1, 1)
+        count = mask.double().sum()
+        terms = [
+            torch.where(mask, squared[..., indices], 0).sum() / (count * len(indices)).clamp_min(1)
+            for indices in self.loss_groups
+            if indices
+        ]
         for i in self.codec.quaternions:
             p = torch.nn.functional.normalize(prediction[..., i : i + 4], dim=-1, eps=1e-8)
             t = torch.nn.functional.normalize(target[..., i : i + 4], dim=-1, eps=1e-8)
-            terms.append((1 - (p * t).sum(-1).square()).mean())
+            error = 1 - (p * t).sum(-1).square()
+            terms.append(torch.where(mask.squeeze(-1), error, 0).sum() / count.clamp_min(1))
         return torch.stack(terms).mean() if terms else prediction.sum() * 0
 
-    def training_loss(self, features, core, valid=None):
-        self.validate_labels(core)
+    def training_loss(self, features, core, valid=None, *, validate=True):
+        """Keep masked batches fixed-size; callers compiling this must validate labels outside."""
+        if validate:
+            self.validate_labels(core)
         features, core = features.reshape(-1, features.shape[-1]), core.reshape(-1, core.shape[-1])
         if valid is not None:
             valid = valid.reshape(-1).bool()
-            features, core = features[valid], core[valid]
-        if not len(core):
-            return sum(p.sum() * 0 for p in self.parameters())
+            features = torch.where(valid[:, None], features, 0)
+            core = torch.where(valid[:, None], core, 0)
         with torch.autocast(device_type=features.device.type, enabled=False):
-            self.update_statistics(features, core)
-            return self.loss(features.double(), core)
+            self.update_statistics(features, core, valid)
+            return self.loss(features.double(), core, valid)
 
     def export(self):
         """Export the online architecture and EMA state, independently of probe formats."""

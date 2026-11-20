@@ -410,11 +410,28 @@ class Dreamer(nn.Module):
             batch_size=state.batch_size,
         )
 
-    def configure_reconstruction(self, config):
-        if self.physics_head is None:
-            raise ValueError("Reconstruction requires an online physics decoder")
-        if self.rep_loss not in ("dreamer", "r2dreamer"):
+    @staticmethod
+    def validate_reconstruction_requirements(
+        *, physics_enabled, truncation_enabled, rep_loss, min_horizon, imag_horizon
+    ):
+        """Shared by the early training check and direct model configuration."""
+        if not physics_enabled:
+            raise ValueError("reconstruction.enabled requires model.physics_decoder.enabled")
+        if not truncation_enabled:
+            raise ValueError("reconstruction.enabled requires model.dynamic_trunc.enabled")
+        if min_horizon >= imag_horizon:
+            raise ValueError("Reconstruction requires dynamic_trunc.min_horizon < imag_horizon to produce candidates")
+        if rep_loss not in ("dreamer", "r2dreamer"):
             raise ValueError("Branch losses currently support dreamer and r2dreamer representations")
+
+    def configure_reconstruction(self, config):
+        self.validate_reconstruction_requirements(
+            physics_enabled=self.physics_head is not None,
+            truncation_enabled=self.dynamic_trunc_enabled,
+            rep_loss=self.rep_loss,
+            min_horizon=self.dynamic_trunc_min_horizon,
+            imag_horizon=self.imag_horizon,
+        )
         self.reconstruction_config = config
 
     @property
@@ -563,7 +580,9 @@ class Dreamer(nn.Module):
             mets["opt/update_rms"] = update_rms
         if self.physics_head is not None and not self.physics_grad_to_wm:
             feat = self.rssm.get_feat(stoch.detach(), deter.detach())
-            loss = self.physics_head.training_loss(feat, data["physics", "core"], data.get("physics_valid"))
+            loss = self.physics_head.training_loss(
+                feat, data["physics", "core"], data.get("physics_valid"), validate=False
+            )
             (loss * self.physics_loss_scale).backward()
             torch.nn.utils.clip_grad_norm_(self.physics_head.parameters(), self.physics_grad_clip)
             self.physics_optimizer.step()
@@ -632,21 +651,7 @@ class Dreamer(nn.Module):
             # (B, T, E) -> (B*T, E)
             x2 = embed.reshape(B * T, -1).detach()  # this detach is important
 
-            if valid is not None:
-                x1, x2 = x1[valid.reshape(-1)], x2[valid.reshape(-1)]
-            if valid is not None and x1.shape[0] < 2:
-                # A short branch window may contain only one genuine observation.
-                # Cross-correlation is undefined; skip this auxiliary term only.
-                losses["barlow"] = x1.sum() * 0
-            else:
-                x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
-                x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
-
-                c = torch.mm(x1_norm.T, x2_norm) / x1.shape[0]
-                invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-                off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
-                redundancy_loss = c[off_diag_mask].pow(2).sum()
-                losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+            losses["barlow"] = networks.barlow_loss(x1, x2, self.barlow_lambd, valid)
         elif self.rep_loss == "infonce":
             # Contrastive (InfoNCE) objective between projected latent features and encoder embeddings.
             # (B, T, F) -> (B*T, F)
@@ -877,7 +882,10 @@ class Dreamer(nn.Module):
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
         if self.physics_head is not None and self.physics_grad_to_wm:
-            physics_loss = self.physics_head.training_loss(feat, data["physics", "core"], data.get("physics_valid"))
+            # update() validates labels before entering this compiled function.
+            physics_loss = self.physics_head.training_loss(
+                feat, data["physics", "core"], data.get("physics_valid"), validate=False
+            )
             total_loss = total_loss + self.physics_loss_scale * physics_loss
             metrics["loss/physics"] = physics_loss.detach()
         self._scaler.scale(total_loss).backward()

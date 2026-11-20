@@ -11,6 +11,8 @@ TASKS = ("finger_spin", "hopper_hop", "quadruped_run", "walker_walk")
 
 
 class OnlinePhysicsEnv(gym.Wrapper):
+    _BRANCH_CHECK_STEPS = 5
+
     def __init__(self, env, config, *, time_limit):
         super().__init__(env)
         self.task_name = str(config.task).removeprefix("dmc_")
@@ -23,7 +25,7 @@ class OnlinePhysicsEnv(gym.Wrapper):
         self.guard = None
         self._guard_profile = None
         self._prepared_reset = None
-        self.policy_steps, self.branch_left, self.in_branch = 0, 0, False
+        self.policy_steps, self.branch_steps, self.branch_left, self.in_branch = 0, 0, 0, False
 
     def reset(self):
         return self.env.reset()
@@ -161,6 +163,7 @@ class OnlinePhysicsEnv(gym.Wrapper):
         self.base._env._reset_next_step = False
         for k, v in context["task_attrs"].items():
             setattr(self.base._env.task, k, v)
+        self.branch_steps = 0
         self.guard.begin_policy_step("branch")
         self.guard.check()
         obs = {
@@ -174,7 +177,11 @@ class OnlinePhysicsEnv(gym.Wrapper):
 
         from reconstruction_guard import UnsafeState
 
-        report = dict(violation=False, samples=[], failure=None, max_depth=0.0, branch=False, root=False)
+        report = dict(
+            violation=False, samples=[], failure=None, failure_details=None, max_depth=0.0, branch=False, root=False
+        )
+        restoring = reset and request is not None
+        branch_step = 0 if restoring else self.branch_steps + 1 if self.in_branch else None
         if thresholds is not None and self.guard is not None:
             self.guard.install_thresholds(thresholds["signature"], thresholds["values"])
         context = None
@@ -185,6 +192,7 @@ class OnlinePhysicsEnv(gym.Wrapper):
                 self.in_branch = True
                 reward, done = 0.0, False
                 report.update(branch=True, root=True)
+                report["max_depth"] = self.guard.max_depth
             elif reset:
                 if self.guard is not None:
                     self.guard.begin_policy_step("off")
@@ -192,18 +200,20 @@ class OnlinePhysicsEnv(gym.Wrapper):
                 obs = prepared if prepared is not None else self.reset()
                 self._prepared_reset = None
                 reward, done = 0.0, False
-                self.policy_steps, self.in_branch = 0, False
+                self.policy_steps, self.branch_steps, self.branch_left, self.in_branch = 0, 0, 0, False
                 context = self.context()
             else:
                 branch = self.in_branch
                 if branch and not np.isfinite(action).all():
                     raise UnsafeState("nonfinite_action")
                 if self.guard is not None:
-                    self.guard.begin_policy_step("branch" if branch else phase)
+                    mode = "branch" if self.branch_steps < self._BRANCH_CHECK_STEPS else "off"
+                    self.guard.begin_policy_step(mode if branch else phase)
                 obs, reward, done, _ = self.step(action)
                 self.policy_steps += 1
                 report["branch"] = branch
                 if branch:
+                    self.branch_steps += 1
                     self.branch_left -= 1
                     if self.branch_left <= 0:
                         done, obs["is_last"] = True, True
@@ -218,13 +228,24 @@ class OnlinePhysicsEnv(gym.Wrapper):
             ):
                 raise UnsafeState("nonfinite_transition")
         except (UnsafeState, FloatingPointError, PhysicsError) as exc:
-            report["failure"] = str(exc)
+            reason = (
+                exc.reason
+                if isinstance(exc, UnsafeState)
+                else ("physics_error" if isinstance(exc, PhysicsError) else "floating_point_error")
+            )
+            report["failure"] = reason
+            report["failure_details"] = dict(
+                message=str(exc),
+                phase="restore" if restoring else "rollout" if self.in_branch else "ordinary",
+                branch_step=branch_step,
+                **(exc.details if isinstance(exc, UnsafeState) else {}),
+            )
             report["branch"] = bool(self.in_branch or request is not None)
             if self.guard is not None:
                 report["max_depth"] = self.guard.max_depth
                 self.guard.begin_policy_step("off")
             obs, reward, done = self.reset(), 0.0, False
-            self.policy_steps, self.in_branch = 0, False
+            self.policy_steps, self.branch_steps, self.branch_left, self.in_branch = 0, 0, 0, False
             context = self.context()
         if context is not None and self.guard is not None and context["model_hash"] != self.guard.model_hash:
             report["guard_failure"] = "model_changed_since_guard_setup"
